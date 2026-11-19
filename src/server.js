@@ -1201,6 +1201,8 @@ function start(options = {}) {
       listen();
       // Film jobs are not resumed: interrupted ones are failed and refunded,
       // and clusters they left behind are torn down.
+      // The background-removal model is fetched once here, off the request path.
+      if (app.film) app.film.photos.warmup().then((state) => console.log(`film photo tools: ${state.reason}`)).catch(() => null);
       return Promise.all([app.pipeline.resume(), app.automation.resume(), app.film ? app.film.pipeline.recover() : null]);
     })
     .catch((error) => {

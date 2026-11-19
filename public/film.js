@@ -123,6 +123,23 @@
     return payload;
   }
 
+  function showReelForm() {
+    $('reel-form').hidden = state.photoIds.length === 0;
+  }
+
+  // One button: every prepared photo becomes a scene.
+  function startReel() {
+    if (!state.photoIds.length) { toast('Сначала подготовьте фото.', 'error'); return; }
+    startJob({
+      photoReel: true,
+      aspect: $('reel-aspect').value,
+      secondsPerPhoto: Number($('reel-seconds').value),
+      backdrop: $('reel-backdrop').value || undefined,
+      cutout: $('reel-look').value === 'cutout',
+      captions: $('reel-captions').value,
+    }, $('reel-submit'));
+  }
+
   function startJob(payload, button) {
     button.disabled = true;
     api('/jobs', { body: jobExtras(payload) }).then(function (data) {
@@ -152,7 +169,7 @@
           if (state.photoIds.indexOf(photo.id) === -1) state.photoIds.push(photo.id);
           var steps = photo.report.map(function (step) {
             var label = { 'remove-bg': 'фон', enhance: 'улучшение', normalize: 'формат' }[step.step] || step.step;
-            var status = { done: 'сделано', skipped: 'не настроено', failed: 'ошибка' }[step.status] || step.status;
+            var status = { done: 'сделано', skipped: 'не настроено', failed: step.reason === 'no_subject' ? 'предмет не отделился' : 'ошибка' }[step.status] || step.status;
             return label + ': ' + status;
           });
           list.append(el('li', '', file.name + ' — ' + steps.join(', ')));
@@ -160,8 +177,8 @@
       });
     });
     chain.then(function () {
-      toast('Фото подготовлены (' + state.photoIds.length + '). Они будут использованы в следующем ролике.', 'ok');
-    }).catch(fail);
+      toast('Фото подготовлены (' + state.photoIds.length + '). Нажмите «Собрать ролик из фото».', 'ok');
+    }).catch(fail).then(showReelForm);
   }
 
   /* ---- audio ---- */
@@ -273,16 +290,40 @@
   function runInpaint() {
     if (!state.mask) { toast('Загрузите исходное фото.', 'error'); return; }
     var rect = state.mask.rect;
-    if (!rect || rect.w < 8 || rect.h < 8) { toast('Выделите область на фото.', 'error'); return; }
+    var hasRect = Boolean(rect && rect.w >= 8 && rect.h >= 8);
+    // Replacing the background works on the whole photo; the other modes need an area.
+    if (!hasRect && $('inpaint-mode').value !== 'background') { toast('Выделите область на фото.', 'error'); return; }
     var source = offscreen(function (ctx, canvas) { ctx.drawImage(state.mask.image, 0, 0, canvas.width, canvas.height); }).toDataURL('image/jpeg', 0.92);
     // Transparent PNG with an opaque white rectangle where the edit happens.
-    var mask = offscreen(function (ctx) { ctx.fillStyle = '#ffffff'; ctx.fillRect(rect.x, rect.y, rect.w, rect.h); }).toDataURL('image/png');
+    var mask = hasRect ? offscreen(function (ctx) { ctx.fillStyle = '#ffffff'; ctx.fillRect(rect.x, rect.y, rect.w, rect.h); }).toDataURL('image/png') : null;
     var product = ($('inpaint-product').files || [])[0];
     $('inpaint-run').disabled = true;
-    (product ? readAsDataUrl(product) : Promise.resolve(null)).then(function (reference) {
-      return api('/inpaint', { body: { image: source, mask: mask, prompt: $('inpaint-prompt').value.trim(), mode: $('inpaint-mode').value, reference: reference } });
+    var background = ($('inpaint-background').files || [])[0];
+    Promise.all([product ? readAsDataUrl(product) : null, background ? readAsDataUrl(background) : null]).then(function (files) {
+      return api('/inpaint', { body: {
+        image: source,
+        mask: mask,
+        prompt: $('inpaint-prompt').value.trim(),
+        mode: $('inpaint-mode').value,
+        reference: files[0],
+        background: files[1],
+        backdrop: $('inpaint-backdrop').value || null,
+      } });
     }).then(function (data) {
-      $('inpaint-link').href = data.result.imageUrl;
+      var result = data.result;
+      var address = result.image || result.imageUrl;
+      $('inpaint-link').href = address;
+      $('inpaint-image').hidden = !result.image;
+      if (result.image) $('inpaint-image').src = result.image;
+      var notes = [];
+      if (result.photoId) {
+        if (state.photoIds.indexOf(result.photoId) === -1) state.photoIds.push(result.photoId);
+        $('photo-list').append(el('li', '', 'Кадр из предметной съёмки — добавлен в ролик'));
+        notes.push('Кадр добавлен к фото для ролика.');
+        showReelForm();
+      }
+      if ((result.notes || []).indexOf('reference_background_kept') !== -1) notes.push('Фон у фото товара не отделился — вставлено как есть.');
+      $('inpaint-status').textContent = notes.join(' ');
       $('inpaint-result').hidden = false;
     }).catch(fail).then(function () { $('inpaint-run').disabled = false; });
   }
@@ -364,9 +405,10 @@
       $('job-detail').hidden = false;
       $('job-detail-title').textContent = (job.plan && job.plan.title) || 'Раскадровка';
       var meta = [];
-      if (job.engine) meta.push({ template: 'план: шаблон', sglang: 'план: SGLang', 'sglang-cache': 'план: SGLang (из кэша)' }[job.engine] || job.engine);
-      if (job.infra && job.infra.provider) meta.push('рендер: ' + job.infra.provider);
-      if (job.infra && job.infra.upscaler) meta.push(job.infra.upscaler === 'recavsr' ? 'апскейл: ReCaVSR' : job.infra.upscaler === 'recavsr-partial' ? 'апскейл: ReCaVSR частично' : 'масштабирование ffmpeg (не апскейл)');
+      if (job.engine) meta.push({ template: 'план: шаблон', 'photo-reel': 'план: по фото', storyboard: 'план: встроенная раскадровка', sglang: 'план: SGLang', 'sglang-cache': 'план: SGLang (из кэша)' }[job.engine] || job.engine);
+      if (job.infra && job.infra.plannerFallback) meta.push('SGLang не ответил');
+      if (job.infra && job.infra.provider) meta.push('рендер: ' + ({ studio: 'встроенная студия (движение камеры по фото)', local: 'видеомодель', ray: 'Ray-кластер', skypilot: 'SkyPilot + Ray' }[job.infra.provider] || job.infra.provider));
+      if (job.infra && job.infra.upscaler) meta.push({ recavsr: 'апскейл: ReCaVSR', 'recavsr-partial': 'апскейл: ReCaVSR частично', native: 'снято сразу в итоговом размере' }[job.infra.upscaler] || 'масштабирование ffmpeg (не апскейл)');
       if (job.audio && job.audio.music) meta.push('музыка: ' + job.audio.music.title);
       if (job.audio && job.audio.voice) meta.push('озвучка: ' + job.audio.voice.title);
       $('job-detail-meta').textContent = meta.join(' · ');
@@ -385,30 +427,57 @@
 
   function missing(names) { return 'не настроено (' + names.join(', ') + ')'; }
 
+  function fillBackdrops(select, backdrops, auto) {
+    select.textContent = '';
+    var first = el('option', '', auto);
+    first.value = '';
+    select.append(first);
+    backdrops.forEach(function (item) {
+      var option = el('option', '', item.label);
+      option.value = item.id;
+      select.append(option);
+    });
+  }
+
   function renderCapabilities(caps) {
+    var bg = caps.photos.steps.filter(function (step) { return step.step === 'remove-bg'; })[0];
     var rows = [
-      ['Сценарий (SGLang)', caps.planner.configured ? 'настроен' : missing(caps.planner.missing)],
-      ['Рендер сцен', caps.render.mode ? { ray: 'Ray-кластер', sky: 'SkyPilot + Ray', local: 'локально, параллельно' }[caps.render.mode] : missing(caps.render.missing)],
+      ['Ролик из своих фото', 'встроенная студия — работает всегда' + (caps.studio.free ? ', без списания генераций' : '')],
+      ['Сценарий длинного фильма', caps.planner.engine === 'sglang' ? 'SGLang' : 'встроенная раскадровка; SGLang не подключён (' + caps.planner.upgrade.join(', ') + ')'],
+      ['Генерация сцен с нуля', caps.render.mode ? { ray: 'Ray-кластер', sky: 'SkyPilot + Ray', local: 'видеомодель, параллельно' }[caps.render.mode] : 'видеомодель не подключена (' + caps.render.missing.join(', ') + ')'],
       ['Аренда GPU (SkyPilot)', !caps.infra.enabled ? 'выключена' : caps.infra.dryRun ? 'dry-run: кластер не запускается' : caps.infra.priceCeilingSet ? 'включена' : 'нет потолка цены (SKYPILOT_MAX_HOURLY_USD)'],
-      ['Апскейл', caps.upscaler.configured ? 'ReCaVSR' : 'масштабирование ffmpeg; ReCaVSR ' + missing(caps.upscaler.missing)],
+      ['Апскейл видеомодели', caps.upscaler.configured ? 'ReCaVSR' : 'масштабирование ffmpeg; ReCaVSR ' + missing(caps.upscaler.missing)],
       ['Музыка по ссылке', caps.audio.download.enabled ? caps.audio.download.hosts.join(', ') : 'выключена'],
       ['Библиотека музыки', caps.audio.library.available ? 'подключена' : missing(caps.audio.library.missing)],
-      ['Удаление фона / улучшение фото', caps.photos.missing.length ? missing(caps.photos.missing) : 'настроено'],
-      ['Замена объекта', caps.inpaint.configured ? 'настроена' : missing(caps.inpaint.missing)],
+      ['Удаление фона', bg && bg.configured ? bg.engine : 'не найдено: установите rembg (' + caps.photos.missing.join(', ') + ')'],
+      ['Улучшение фото', 'встроено'],
+      ['Предметная съёмка', 'фон, вставка, очистка — встроено; нейросеть: ' + (caps.inpaint.generative.configured ? 'подключена' : missing(caps.inpaint.generative.missing))],
     ];
     var list = $('caps-list');
     list.textContent = '';
     rows.forEach(function (row) { list.append(el('dt', '', row[0]), el('dd', '', row[1])); });
-    if (!caps.planner.configured || !caps.render.mode) $('film-submit').disabled = true;
-    if (!caps.render.mode) $('preset-submit').disabled = true;
-    if (!caps.inpaint.configured) {
-      $('inpaint-run').disabled = true;
-      $('inpaint-note').textContent = 'Сервис замены объекта на этом сервере не подключён.';
+    fillBackdrops($('reel-backdrop'), caps.studio.backdrops, 'Подобрать автоматически');
+    fillBackdrops($('inpaint-backdrop'), caps.studio.backdrops, 'Светлая студия');
+    state.generative = caps.inpaint.generative.configured;
+    state.renderMode = caps.render.mode;
+    Array.prototype.forEach.call($('inpaint-mode').options, function (option) {
+      if (option.dataset.generative && !state.generative) option.disabled = true;
+    });
+    if (!bg || !bg.configured) {
+      $('reel-look').value = 'photo';
+      $('reel-look').options[0].disabled = true;
     }
-    if (caps.render.mode && caps.render.mode !== 'local') {
-      $('photo-upload').disabled = true;
-      $('photos-note').textContent = 'Ролик по своим фото работает только с локальным рендером; на этом сервере рендер идёт на кластере.';
+    if (!caps.render.mode) {
+      $('templates-note').textContent = 'Видеомодель не подключена: шаблон будет снят по вашим фото. Сначала подготовьте фото ниже.';
+      $('film-note').textContent = 'Видеомодель не подключена: фильм будет собран из ваших фото по встроенной раскадровке. Сначала подготовьте фото.';
     }
+  }
+
+  // Without a video model a template or a long film is shot from the photos.
+  function needsPhotos() {
+    if (state.renderMode || state.photoIds.length) return false;
+    toast('Сначала подготовьте фото в разделе «Свои фото».', 'error');
+    return true;
   }
 
   /* ---- boot ---- */
@@ -432,10 +501,12 @@
     $('preview-btn').addEventListener('click', previewPreset);
     $('preset-form').addEventListener('submit', function (event) {
       event.preventDefault();
+      if (needsPhotos()) return;
       startJob({ templateId: state.selected, metadata: metadata() }, $('preset-submit'));
     });
     $('film-form').addEventListener('submit', function (event) {
       event.preventDefault();
+      if (needsPhotos()) return;
       startJob({
         brief: { brief: $('film-brief').value.trim() },
         scenes: Number($('film-scenes').value),
@@ -444,8 +515,10 @@
       }, $('film-submit'));
     });
     $('photo-upload').addEventListener('click', uploadPhotos);
+    $('reel-submit').addEventListener('click', startReel);
     $('photo-clear').addEventListener('click', function () {
       state.photoIds = [];
+      showReelForm();
       $('photo-list').textContent = '';
       $('photo-files').value = '';
     });

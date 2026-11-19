@@ -40,7 +40,7 @@
     <div id="film-on" hidden>
       <section class="film-section" aria-labelledby="templates-title">
         <h1 id="templates-title">Reels по шаблону</h1>
-        <p class="film-hint">Выберите шаблон и заполните четыре поля. Раскадровка, движение камеры (Pan Left), 24 кадра/с, формат 9:16 и стиль Cinematic 4K заданы шаблоном и из интерфейса не меняются.</p>
+        <p class="film-hint" id="templates-note">Выберите шаблон и заполните четыре поля. Раскадровка, движение камеры (Pan Left), 24 кадра/с, формат 9:16 и стиль Cinematic 4K заданы шаблоном и из интерфейса не меняются.</p>
         <div class="template-grid" id="template-grid" role="group" aria-label="Шаблоны"></div>
         <form class="film-form" id="preset-form" novalidate>
           <div class="field">
@@ -73,7 +73,7 @@
 
       <section class="film-section" aria-labelledby="photos-title">
         <h2 id="photos-title">Свои фото</h2>
-        <p class="film-hint" id="photos-note">Загрузите фото как есть. Каждое проходит подготовку и становится первым кадром сцены: сцены берут фото по очереди.</p>
+        <p class="film-hint" id="photos-note">Загрузите фото как есть. Каждое очищается, предмет отделяется от фона. Дальше — одна кнопка: ролик собирается прямо на сервере, предмет на видео остаётся точно таким, как на фото.</p>
         <div class="film-form">
           <div class="field field-wide">
             <label for="photo-files">Фото (PNG, JPEG, WebP, до 8 МБ каждое)</label>
@@ -85,11 +85,44 @@
           </div>
         </div>
         <ul class="report-list" id="photo-list"></ul>
+        <div class="film-form" id="reel-form" hidden>
+          <div class="field">
+            <label for="reel-look">Подача</label>
+            <select id="reel-look">
+              <option value="cutout">Предмет на студийном фоне</option>
+              <option value="photo">Фото целиком</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="reel-backdrop">Фон студии</label>
+            <select id="reel-backdrop"></select>
+          </div>
+          <div class="field">
+            <label for="reel-aspect">Формат</label>
+            <select id="reel-aspect">
+              <option value="9:16">9:16 — Reels, Shorts</option>
+              <option value="1:1">1:1 — лента</option>
+              <option value="4:5">4:5 — лента</option>
+              <option value="16:9">16:9 — YouTube</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="reel-seconds">Секунд на фото</label>
+            <input id="reel-seconds" type="number" min="2" max="10" step="1" value="4">
+          </div>
+          <div class="field field-wide">
+            <label for="reel-captions">Подписи на экране (по одной на строку, необязательно)</label>
+            <textarea id="reel-captions" rows="3" maxlength="2000" placeholder="Новая коллекция&#10;Ручная работа&#10;Доставка за 2 дня"></textarea>
+          </div>
+          <div class="film-actions">
+            <button class="btn btn-primary" type="button" id="reel-submit">Собрать ролик из фото</button>
+          </div>
+        </div>
       </section>
 
       <section class="film-section" aria-labelledby="film-title">
         <h2 id="film-title">Длинный фильм (24–36 сцен)</h2>
-        <p class="film-hint">Сценарий и раскадровку пишет языковая модель (SGLang), сцены рендерятся параллельно, затем апскейл и сборка в один MP4.</p>
+        <p class="film-hint" id="film-note">Раскадровку пишет языковая модель (SGLang), а если она не подключена — встроенный раскадровщик. Сцены рендерятся параллельно и собираются в один MP4.</p>
         <form class="film-form" id="film-form" novalidate>
           <div class="field field-wide">
             <label for="film-brief">О чём фильм</label>
@@ -146,36 +179,49 @@
       </section>
 
       <section class="film-section" aria-labelledby="inpaint-title">
-        <h2 id="inpaint-title">Замена объекта по маске</h2>
-        <p class="film-hint" id="inpaint-note">Загрузите фото, выделите область мышью и опишите, что должно в ней появиться. Всё вне выделения остаётся исходным.</p>
+        <h2 id="inpaint-title">Предметная съёмка по маске</h2>
+        <p class="film-hint" id="inpaint-note">Загрузите фото и при необходимости выделите область мышью. Сам товар не перерисовывается: меняется только то, что вокруг него или в выделенной области.</p>
         <div class="film-form">
           <div class="field">
             <label for="inpaint-source">Исходное фото</label>
             <input id="inpaint-source" type="file" accept="image/png,image/jpeg,image/webp">
           </div>
           <div class="field">
-            <label for="inpaint-product">Фото продукта (необязательно)</label>
+            <label for="inpaint-product">Фото товара (для вставки)</label>
             <input id="inpaint-product" type="file" accept="image/png,image/jpeg,image/webp">
+          </div>
+          <div class="field">
+            <label for="inpaint-background">Свой фон (необязательно)</label>
+            <input id="inpaint-background" type="file" accept="image/png,image/jpeg,image/webp">
+          </div>
+          <div class="field">
+            <label for="inpaint-backdrop">Фон студии</label>
+            <select id="inpaint-backdrop"></select>
           </div>
           <div class="field">
             <label for="inpaint-mode">Действие</label>
             <select id="inpaint-mode">
-              <option value="replace">Заменить</option>
-              <option value="remove">Убрать</option>
+              <option value="background">Заменить фон, товар оставить</option>
+              <option value="insert">Вставить товар в выделенную область</option>
+              <option value="erase">Убрать мелкую деталь в области</option>
+              <option value="replace" data-generative="true">Нарисовать новое в области (нейросеть)</option>
+              <option value="remove" data-generative="true">Убрать объект (нейросеть)</option>
             </select>
           </div>
           <div class="field field-wide">
-            <label for="inpaint-prompt">Что должно быть в выделенной области</label>
+            <label for="inpaint-prompt">Что нарисовать (только для режимов с нейросетью)</label>
             <input id="inpaint-prompt" type="text" maxlength="800" autocomplete="off" placeholder="стеклянная банка крема с белой крышкой">
           </div>
         </div>
         <canvas class="mask-canvas" id="inpaint-canvas" width="640" height="360" aria-label="Область замены: выделите прямоугольник мышью" hidden></canvas>
         <div class="film-actions">
-          <button class="btn btn-primary" type="button" id="inpaint-run">Выполнить замену</button>
+          <button class="btn btn-primary" type="button" id="inpaint-run">Выполнить</button>
         </div>
-        <p class="film-hint" id="inpaint-result" hidden>
-          <a id="inpaint-link" href="/film" rel="noopener noreferrer" target="_blank">Открыть результат</a>
-        </p>
+        <div id="inpaint-result" hidden>
+          <img class="result-image" id="inpaint-image" alt="Результат обработки">
+          <p class="film-hint" id="inpaint-status"></p>
+          <p class="film-hint"><a id="inpaint-link" href="/film" rel="noopener noreferrer" target="_blank" download="product.jpg">Скачать результат</a></p>
+        </div>
       </section>
 
       <section class="film-section" aria-labelledby="jobs-title">

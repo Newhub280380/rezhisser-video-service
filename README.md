@@ -420,36 +420,79 @@ download link **only** for a real `https` video URL.
 
 ## Film pipeline (`/film`)
 
-Template reels and long films, assembled into one MP4. Off by default
-(`FILM_ENABLED=true` turns it on; while it is off, `/api/film/*` does not exist).
+Reels from your own photos, template reels and long films, assembled into one
+MP4. Off by default (`FILM_ENABLED=true` turns it on; while it is off,
+`/api/film/*` does not exist).
 
 ```
 plan  ->  render every scene in parallel  ->  upscale  ->  assemble MP4
 ```
 
+### Works with nothing but ffmpeg
+
+With `FILM_ENABLED=true` and `ffmpeg`/`ffprobe` installed, these need no key,
+no GPU, no network service and no paid provider:
+
+- **Reel from your photos, one button** (`photoReel`). Each photo becomes a
+  scene. The built-in studio (`src/film/studio.js`) moves a virtual camera over
+  the photo and renders straight at the final size (4K by default), so there is
+  no upscale step. The subject is never redrawn: its pixels are only moved,
+  scaled and lit, so a label, a logo or a face cannot drift. With a cut-out the
+  subject floats over a studio backdrop with a soft shadow; without one the
+  whole photo is used. This is camera motion over a still image — people do not
+  move and nothing new is drawn; such a job reports `infra.provider: "studio"`.
+- **Photo clean-up.** Denoise, sharpen, Lanczos resize, transparency flattened,
+  metadata stripped. It cleans a photo up; it does not invent detail.
+- **Product shots** (`POST /api/film/inpaint`): `background` (keep the product,
+  replace what is around it), `insert` (place a product into the marked area),
+  `erase` (fill a small marked area from its surroundings). Compositing only;
+  the result is also registered as a prepared photo, ready for a reel.
+- **Long-film storyboard** when no language model is connected, and as the
+  fallback when SGLang does not answer (`engine: "storyboard"`). It lays your
+  own words over a fixed editorial rhythm; it does not write a story.
+- **Captions** (one line per caption, spread over the film), burned-in
+  subtitles, music with fades and loudness normalisation, voiceover ducking.
+
+Two optional local tools are picked up automatically when installed:
+`rembg` (background removal; without it reels use the whole photo and
+`background` is unavailable) and `yt-dlp` (audio from a video link).
+
+`FILM_STUDIO_FREE=true` makes studio reels not consume account generations
+(they cost nothing to render). Off by default.
+
+### Upgrades that need something you provide
+
 | Stage | What runs | Needs |
 | --- | --- | --- |
-| Plan, template reel | A fixed storyboard from `src/film/templates.js`; no model is called. | — |
-| Plan, long film (24–36 scenes) | An SGLang server, asked for `shot_plan.json` with a JSON schema; the answer is validated again here, repaired once, otherwise the job fails. | `SGLANG_BASE_URL`, `SGLANG_MODEL` |
-| Render | In order of preference: an existing Ray cluster, a cluster rented with SkyPilot, or this machine (scenes in parallel through Seedance). | `RAY_DASHBOARD_URL`, or `SKYPILOT_*`, or `SEEDANCE_*` |
-| Upscale | A command you configure, run once per clip. Without it clips are resized with ffmpeg (Lanczos) and the job says so. | `RECAVSR_COMMAND` |
-| Assemble | ffmpeg: scene order, exact frame size and 24 fps, burned-in subtitles, music and voiceover. | `ffmpeg`, `ffprobe` |
+| Plan, long film | An SGLang server, asked for `shot_plan.json` with a JSON schema; validated again here, repaired once. If it fails, the built-in storyboard takes over and the job says so. | `SGLANG_BASE_URL`, `SGLANG_MODEL` |
+| Render from text | A generative video model. In order of preference: an existing Ray cluster, a cluster rented with SkyPilot, or this machine (scenes in parallel through Seedance). Without any of them, films are made from photos only. | `RAY_DASHBOARD_URL`, or `SKYPILOT_*`, or `SEEDANCE_*` |
+| Upscale of model clips | A command you configure, run once per clip. Without it clips are resized with ffmpeg (Lanczos) and the job says so. Studio clips skip this stage. | `RECAVSR_COMMAND` |
+| Generative edit by mask | `replace`, `remove`, `extend`: a model draws inside the mask. | `INPAINT_BASE_URL`, `INPAINT_MODEL` |
 
-### What is and is not included
+With photos and a video model on this host, `photoMode` chooses: `studio`
+(default for `photoReel`) or `ai` (the model animates the photos as first
+frames). On a Ray/SkyPilot deployment photos are always rendered by the studio.
 
-- **Tested with real tools:** the ffmpeg assembly and the photo normalisation
-  (the tests run ffmpeg when it is installed).
-- **Tested against fakes only:** SGLang, Ray, SkyPilot, the upscaler command,
-  yt-dlp and the inpainting service. Their requests follow the public
-  documentation, but none of them has been run against a live server from this
-  repository. Try each one on a small job before relying on it.
-- **Not included:** a video model for clusters. On Ray or SkyPilot the driver
+### What has and has not been run for real
+
+- **Run for real** (tests execute them when the tools are installed): the ffmpeg
+  assembly, photo clean-up, the studio renderer in every camera move, the three
+  built-in product-shot modes, and one HTTP test that goes from uploaded photos
+  to a downloaded 1080×1920 MP4 with no fakes for the film stages. `rembg`
+  background removal is tested for real only where its model is already
+  downloaded. Audio extraction with `yt-dlp` was run by hand against YouTube,
+  not in the test suite (tests never use the network).
+- **Tested against fakes only:** SGLang, Ray, SkyPilot, the upscaler command and
+  the generative inpainting service. Their requests follow the public
+  documentation, but none has been run against a live server from this
+  repository. Try each on a small job before relying on it.
+- **Not included:** a generative video model. On Ray or SkyPilot the driver
   (`python/rezhisser_film/film_job.py`) sends every scene to a render service
-  you operate (`FILM_RENDER_ENDPOINT`, contract in the file header). ReCaVSR,
-  background removal, photo enhancement and inpainting models are not included
-  either; each is an adapter to a command or service you provide.
-- **Film from your own photos** works with local rendering only: prepared
-  photos become the first frames of the scenes, in order.
+  you operate (`FILM_RENDER_ENDPOINT`, contract in the file header). ReCaVSR
+  and a generative inpainting model are not included either; each is an
+  adapter to a command or service you provide.
+- The `erase` mode fills from neighbouring pixels: fine for a small mark on a
+  plain surface, visible on a textured one.
 
 ### Templates
 
@@ -479,8 +522,8 @@ service. `SKYPILOT_DRY_RUN=true` (the default) never starts a cluster.
 
 ### Billing and recovery
 
-One film reserves one generation from the account. A failed or cancelled film
-returns it. Films interrupted by a restart are marked failed and refunded; they
+One film reserves one generation from the account (studio reels do not when
+`FILM_STUDIO_FREE=true`). A failed or cancelled film returns it. Films interrupted by a restart are marked failed and refunded; they
 are not resumed. Finished films are removed after `FILM_RETENTION_DAYS` by
 `src/cron/cleanup.js`.
 
@@ -489,18 +532,18 @@ are not resumed. Finished films are removed after `FILM_RETENTION_DAYS` by
 | Method | Path | Description |
 | --- | --- | --- |
 | `GET` | `/film` | The page: templates, own photos, long film, music, object replacement, jobs. |
-| `GET` | `/api/film/capabilities` | Which stage is configured and which variables are missing (names only). |
+| `GET` | `/api/film/capabilities` | What works now, which engine does it, and which variables an upgrade needs (names only). |
 | `GET` | `/api/film/templates` | The presets and their locked parameters. |
 | `POST` | `/api/film/presets` | `{ templateId, metadata }` → the fixed shot plan. Free; no provider is called. |
-| `POST` | `/api/film/jobs` | Account. `{ templateId, metadata }` or `{ brief, scenes, durationSeconds, aspect }`, plus optional `audio`, `voice` (`{ trackId }` or `{ downloadId }`) and `photoIds`. |
+| `POST` | `/api/film/jobs` | Account. `{ photoReel: true, photoIds, aspect?, secondsPerPhoto?, backdrop?, cutout? }`, or `{ templateId, metadata }`, or `{ brief, scenes, durationSeconds, aspect }`. Optional for all: `photoIds`, `photoMode` (`studio` / `ai`), `captions`, `audio`, `voice` (`{ trackId }` or `{ downloadId }`). |
 | `GET` | `/api/film/jobs` | Account. The caller's last 50 films. |
 | `GET` | `/api/film/jobs/:id` | Account. Job, plan and per-scene status. |
 | `GET` | `/api/film/jobs/:id/video` | Account. The MP4 (redirect to a signed link, or the file itself). |
 | `POST` | `/api/film/jobs/:id/cancel` | Account. Stops the job, destroys its cluster, refunds it. |
-| `POST` | `/api/film/photos/prepare` | Account. Up to 6 photos per request → ids and a per-step report. |
+| `POST` | `/api/film/photos/prepare` | Account. Up to 6 photos per request → ids, `cutout` (subject separated or not) and a per-step report. |
 | `GET` | `/api/film/audio/library` | Account. Tracks from `FILM_MUSIC_DIR`. |
 | `POST` | `/api/film/audio/link` | Account. Extracts the audio of a video page (allowed hosts only) → `downloadId`. |
-| `POST` | `/api/film/inpaint` | Account. `{ image, mask, prompt, mode, reference? }` → edited image URL. |
+| `POST` | `/api/film/inpaint` | Account. `{ image, mode, mask?, reference?, background?, backdrop?, prompt? }`. Built-in modes return `{ image (data URL), photoId }`; generative modes return `{ imageUrl }`. |
 
 Use only music you have the rights to; extracting audio from a video page does
 not grant any.

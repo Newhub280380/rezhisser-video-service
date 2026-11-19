@@ -1,10 +1,12 @@
 'use strict';
 
 // Film pipeline tests. External services (SGLang, Ray, SkyPilot, the video
-// provider, yt-dlp, the inpainting service) are replaced by fakes that record
-// what they were asked. ffmpeg is the exception: when it is installed, the
-// assembly and photo-normalisation commands are run for real, because a filter
-// graph that only "looks right" proves nothing.
+// provider, yt-dlp, the generative inpainting service) are replaced by fakes
+// that record what they were asked. ffmpeg is the exception: when it is
+// installed, the assembly, the photo clean-up, the built-in studio and the
+// product-shot editor are run for real, because a filter graph that only
+// "looks right" proves nothing. Background removal runs for real only when
+// rembg and its model are already on the machine.
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -23,17 +25,48 @@ const { createComposer, buildSubtitles, buildAssemblyArgs, srtTime } = require('
 const { createAudio, validateSourceUrl, AudioError } = require('../src/film/audio.js');
 const { createCache } = require('../src/film/cache.js');
 const { listTemplates, buildPreset } = require('../src/film/templates.js');
-const { createPhotoPipeline, sniffImage, PhotoError } = require('../src/film/photos.js');
+const { createPhotoPipeline, sniffImage, parseOutline, findOnPath, PhotoError } = require('../src/film/photos.js');
+const { createStudio, motion, pickBackdrop, listBackdrops } = require('../src/film/studio.js');
+const { buildStoryboard, buildPhotoReel, applyCaptions } = require('../src/film/storyboard.js');
 const { createInpainter } = require('../src/film/inpaint.js');
 const { createSceneRenderer, downloadClip } = require('../src/film/render.js');
 const { createFilmPipeline } = require('../src/film/jobs.js');
-const { filmConfig, createFilmStack } = require('../src/film/index.js');
+const { filmConfig, createFilmStack, limited } = require('../src/film/index.js');
 const { createMemoryDatabase } = require('../src/db/memory.js');
 const { withServer, fakeServices, productionOptions, accountClient } = require('./helpers/production.js');
 
 const PNG_1PX = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg==';
 const HAS_FFMPEG = spawnSync('ffmpeg', ['-version']).status === 0 && spawnSync('ffprobe', ['-version']).status === 0;
+// Real background removal is exercised only where the tool and its model are
+// already present: a test must never download a model.
+const REMBG_MODEL_FILES = [
+  path.join(process.env.U2NET_HOME || path.join(os.homedir(), '.u2net'), 'u2netp.onnx'),
+  path.join(os.homedir(), '.rembg', 'models', 'u2netp', 'u2netp.onnx'),
+];
+const HAS_REMBG = HAS_FFMPEG && Boolean(findOnPath('rembg')) && REMBG_MODEL_FILES.some((file) => fs.existsSync(file));
+const NO_PATH = { PATH: '' };
 const quiet = { error() {}, log() {}, warn() {} };
+
+function ffmpegOk(args) {
+  const result = spawnSync('ffmpeg', ['-y', '-v', 'error', ...args]);
+  assert.equal(result.status, 0, String(result.stderr));
+}
+
+function probeVideo(file) {
+  const out = spawnSync('ffprobe', ['-v', 'error', '-select_streams', 'v:0', '-count_frames', '-show_entries', 'stream=codec_name,width,height,nb_read_frames,pix_fmt', '-of', 'json', file]).stdout.toString();
+  return JSON.parse(out).streams[0];
+}
+
+// A "product photo": a dark red box on a light backdrop.
+function productPhoto(file, size = '640x480') {
+  ffmpegOk(['-f', 'lavfi', '-i', `color=c=0xd8d2c8:s=${size}`, '-vf', 'drawbox=x=iw/2-60:y=ih/2-110:w=120:h=220:color=0x7a1f3d:t=fill', '-frames:v', '1', file]);
+  return file;
+}
+
+function asDataUrl(file) {
+  const mime = file.endsWith('.png') ? 'image/png' : 'image/jpeg';
+  return `data:${mime};base64,${fs.readFileSync(file).toString('base64')}`;
+}
 
 function tempDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'film-test-'));
@@ -588,13 +621,13 @@ test('templates: every template is locked the same way; bad input is rejected', 
 test('photos: real magic bytes decide, uploads are validated', async () => {
   assert.equal(sniffImage(Buffer.from(PNG_1PX.split(',')[1], 'base64')).mime, 'image/png');
   assert.equal(sniffImage(Buffer.from('definitely not an image')), null);
-  const pipeline = createPhotoPipeline({ workDir: tempDir(), runner: async () => ({ ok: false, code: 'step_failed' }) });
+  const pipeline = createPhotoPipeline({ workDir: tempDir(), env: NO_PATH, runner: async () => ({ ok: false, code: 'step_failed' }) });
   await assert.rejects(() => pipeline.prepareAll([], { userId: 'u1' }), PhotoError);
   await assert.rejects(() => pipeline.prepareAll(['data:image/png;base64,bm90YW5pbWFnZQ=='], { userId: 'u1' }), (error) => error.code === 'unsupported_photo');
   await assert.rejects(() => pipeline.prepareAll([PNG_1PX], { userId: '../x' }), (error) => error.code === 'invalid_owner');
 });
 
-test('photos: unconfigured steps are skipped, a failed step is reported, duplicates dropped', async () => {
+test('photos: enhancement is built in; a failed background removal is reported; duplicates dropped', async () => {
   const dir = tempDir();
   const calls = [];
   const runner = async (bin, args) => {
@@ -603,48 +636,179 @@ test('photos: unconfigured steps are skipped, a failed step is reported, duplica
     fs.writeFileSync(args[args.length - 1], 'jpeg-bytes');
     return { ok: true };
   };
-  const pipeline = createPhotoPipeline({ workDir: dir, steps: { removeBg: 'rembg i {in} {out}' }, runner });
+  const pipeline = createPhotoPipeline({ workDir: dir, steps: { removeBg: 'rembg i {in} {out}' }, env: NO_PATH, runner });
   const photos = await pipeline.prepareAll([PNG_1PX, PNG_1PX], { userId: 'user-1' });
   assert.equal(photos.length, 1);
   assert.deepEqual(photos[0].report, [
     { step: 'remove-bg', status: 'failed', reason: 'step_failed' },
-    { step: 'enhance', status: 'skipped', reason: 'not_configured' },
+    { step: 'enhance', status: 'done', engine: 'built-in' },
     { step: 'normalize', status: 'done' },
   ]);
   assert.equal(photos[0].fullyProcessed, false);
-  assert.deepEqual(calls, ['rembg', 'ffmpeg']);
-  assert.deepEqual(pipeline.capability().missing, ['FILM_ENHANCE_COMMAND']);
+  assert.equal(photos[0].cutout, false);
+  // Clean-up first (two sizes), then background removal on the cleaned photo.
+  assert.deepEqual(calls, ['ffmpeg', 'ffmpeg', 'rembg']);
+  assert.deepEqual(pipeline.capability().missing, []);
 
-  // Only the final JPEG is kept, and only its owner can resolve it.
-  assert.deepEqual(fs.readdirSync(path.join(dir, 'user-1')), [`${photos[0].id}.jpg`]);
-  assert.equal(pipeline.resolve('user-1', [photos[0].id])[0].path, path.join(dir, 'user-1', `${photos[0].id}.jpg`));
-  assert.throws(() => pipeline.resolve('user-2', [photos[0].id]), (error) => error.code === 'unknown_photo');
+  // Only the two clean JPEGs are kept, and only their owner can resolve them.
+  const id = photos[0].id;
+  assert.deepEqual(fs.readdirSync(path.join(dir, 'user-1')).sort(), [`${id}.full.jpg`, `${id}.jpg`]);
+  const resolved = pipeline.resolve('user-1', [id])[0];
+  assert.equal(resolved.path, path.join(dir, 'user-1', `${id}.jpg`));
+  assert.equal(resolved.fullPath, path.join(dir, 'user-1', `${id}.full.jpg`));
+  assert.equal(resolved.cutPath, null);
+  assert.throws(() => pipeline.resolve('user-2', [id]), (error) => error.code === 'unknown_photo');
   assert.throws(() => pipeline.resolve('user-1', ['../../etc/passwd']), (error) => error.code === 'unknown_photo');
+});
+
+test('photos: rembg is used when it is installed, never when switched off', async () => {
+  const bin = tempDir();
+  const tool = path.join(bin, process.platform === 'win32' ? 'rembg.exe' : 'rembg');
+  fs.writeFileSync(tool, '');
+  const env = { PATH: bin };
+  assert.equal(findOnPath('rembg', env), tool);
+  assert.equal(findOnPath('rembg', NO_PATH), null);
+
+  const found = createPhotoPipeline({ workDir: tempDir(), env }).capability();
+  assert.deepEqual(found.steps[0], { step: 'remove-bg', configured: true, engine: 'rembg (u2netp)' });
+  assert.deepEqual(found.missing, []);
+  const absent = createPhotoPipeline({ workDir: tempDir(), env: NO_PATH }).capability();
+  assert.equal(absent.steps[0].configured, false);
+  assert.deepEqual(absent.missing, ['FILM_REMOVE_BG_COMMAND']);
+  assert.equal(createPhotoPipeline({ workDir: tempDir(), env, steps: { removeBg: 'off' } }).capability().steps[0].configured, false);
+  // Enhancement and normalisation never depend on anything external.
+  assert.ok(absent.steps.slice(1).every((step) => step.configured));
+
+  // The installed tool is started with a fixed argv; a cut-out with no
+  // transparency is "no subject", not a success.
+  const calls = [];
+  const runner = async (cmd, args) => {
+    calls.push([cmd, ...args]);
+    if (cmd === tool) fs.writeFileSync(args[args.length - 1], 'png');
+    if (cmd === 'ffmpeg' && args.includes('null')) return { ok: true, stdout: 'lavfi.bbox.x1=0\nlavfi.bbox.y1=0\nlavfi.bbox.w=64\nlavfi.bbox.h=64\nlavfi.signalstats.YAVG=255\n' };
+    return { ok: true };
+  };
+  const pipeline = createPhotoPipeline({ workDir: tempDir(), env, runner });
+  const out = path.join(tempDir(), 'cut.png');
+  assert.deepEqual(await pipeline.cutSubject('in.jpg', out), { ok: false, reason: 'no_subject' });
+  assert.deepEqual(calls[0], [tool, 'i', '-m', 'u2netp', 'in.jpg', out]);
+  assert.equal(fs.existsSync(out), false);
+  assert.deepEqual(parseOutline('lavfi.bbox.x1=646\nlavfi.bbox.y1=147\nlavfi.bbox.w=309\nlavfi.bbox.h=807\nlavfi.signalstats.YAVG=29.8\n').box, { x: 646, y: 147, w: 309, h: 807 });
+  assert.equal(parseOutline('nothing'), null);
 });
 
 test('photos (real ffmpeg): a transparent PNG becomes a clean JPEG', { skip: !HAS_FFMPEG }, async () => {
   const dir = tempDir();
   const source = path.join(dir, 'src.png');
   // 300x200 half-transparent red: an odd-ish size with an alpha channel.
-  assert.equal(spawnSync('ffmpeg', ['-y', '-v', 'error', '-f', 'lavfi', '-i', 'color=c=red@0.5:s=301x200,format=rgba', '-frames:v', '1', source]).status, 0);
-  const upload = `data:image/png;base64,${fs.readFileSync(source).toString('base64')}`;
+  ffmpegOk(['-f', 'lavfi', '-i', 'color=c=red@0.5:s=301x200,format=rgba', '-frames:v', '1', source]);
+  const pipeline = createPhotoPipeline({ workDir: dir, steps: { removeBg: 'off' } });
+  const [photo] = await pipeline.prepareAll([asDataUrl(source)], { userId: 'user-1' });
+  assert.deepEqual(photo.report.map((step) => step.status), ['skipped', 'done', 'done']);
+  const resolved = pipeline.resolve('user-1', [photo.id])[0];
+  for (const file of [resolved.path, resolved.fullPath]) {
+    const probe = JSON.parse(spawnSync('ffprobe', ['-v', 'error', '-show_entries', 'stream=codec_name,width,height,pix_fmt', '-of', 'json', file]).stdout.toString());
+    assert.equal(probe.streams[0].codec_name, 'mjpeg');
+    assert.equal(probe.streams[0].width % 2, 0);
+    assert.equal(probe.streams[0].height, 200);
+    assert.doesNotMatch(probe.streams[0].pix_fmt, /a$/);
+  }
+});
+
+test('photos (real rembg): the subject is cut out and cropped to its outline', { skip: !HAS_REMBG }, async () => {
+  const dir = tempDir();
   const pipeline = createPhotoPipeline({ workDir: dir });
-  const [photo] = await pipeline.prepareAll([upload], { userId: 'user-1' });
-  assert.equal(photo.report.find((step) => step.step === 'normalize').status, 'done');
-  const file = pipeline.resolve('user-1', [photo.id])[0].path;
-  const probe = JSON.parse(spawnSync('ffprobe', ['-v', 'error', '-show_entries', 'stream=codec_name,width,height,pix_fmt', '-of', 'json', file]).stdout.toString());
-  assert.equal(probe.streams[0].codec_name, 'mjpeg');
-  assert.equal(probe.streams[0].width % 2, 0);
-  assert.equal(probe.streams[0].height, 200);
-  assert.doesNotMatch(probe.streams[0].pix_fmt, /a$/);
+  const [photo] = await pipeline.prepareAll([asDataUrl(productPhoto(path.join(dir, 'p.jpg')))], { userId: 'user-1' });
+  assert.deepEqual(photo.report.map((step) => [step.step, step.status]), [['remove-bg', 'done'], ['enhance', 'done'], ['normalize', 'done']]);
+  assert.equal(photo.cutout, true);
+  const cut = pipeline.resolve('user-1', [photo.id])[0].cutPath;
+  const probe = JSON.parse(spawnSync('ffprobe', ['-v', 'error', '-show_entries', 'stream=width,height,pix_fmt', '-of', 'json', cut]).stdout.toString()).streams[0];
+  assert.match(probe.pix_fmt, /rgba/);
+  // Cropped to the box (120x220 in the source), then enlarged: taller than wide.
+  assert.ok(probe.height > probe.width * 1.5, JSON.stringify(probe));
+});
+
+// ---- built-in studio ----
+
+test('studio: camera moves are bounded expressions; the backdrop follows the style', () => {
+  const size = { width: 1080, height: 1920 };
+  assert.deepEqual(motion('static', 5, size), { z: '1', dx: '0', dy: '0' });
+  // The camera pans left, so the subject travels right: from -a to +a.
+  assert.equal(motion('pan-left', 5, size).dx, '98*((t/5)-0.5)');
+  assert.equal(motion('pan-right', 5, size).dx, '-98*((t/5)-0.5)');
+  assert.equal(motion('dolly-in', 4, size).z, '(1+0.09*(t/4))');
+  assert.equal(pickBackdrop('dark', 'тёплый'), 'dark');
+  assert.equal(pickBackdrop(undefined, 'тёплый минимализм'), 'warm');
+  assert.equal(pickBackdrop('nope', ''), 'light');
+  assert.ok(listBackdrops().length >= 5);
+});
+
+test('studio (real ffmpeg): a photo becomes a clip of the exact size and length; the subject is not redrawn', { skip: !HAS_FFMPEG }, async () => {
+  const dir = tempDir();
+  const photo = productPhoto(path.join(dir, 'p.jpg'));
+  // The cut-out: the product box alone on transparency.
+  const cut = path.join(dir, 'cut.png');
+  ffmpegOk(['-f', 'lavfi', '-i', 'color=c=0x7a1f3d:s=120x220,format=rgba', '-frames:v', '1', cut]);
+  const studio = createStudio({ workDir: dir });
+  const context = { jobId: 'job', fps: 24, size: { width: 540, height: 960 } };
+
+  const full = await studio.renderScene({ n: 1, durationSeconds: 2, camera: 'pan-left', photo: { path: photo } }, context);
+  assert.equal(full.look, 'photo');
+  assert.deepEqual(probeVideo(full.path), { codec_name: 'h264', width: 540, height: 960, pix_fmt: 'yuv420p', nb_read_frames: '48' });
+
+  const pack = await studio.renderScene({ n: 2, durationSeconds: 2, camera: 'static', photo: { path: photo, cutPath: cut } }, { ...context, backdrop: 'dark' });
+  assert.equal(pack.look, 'packshot');
+  assert.equal(probeVideo(pack.path).nb_read_frames, '48');
+  // Centre pixel = the product's own colour; corner = the dark backdrop.
+  const pixel = (x, y) => [...spawnSync('ffmpeg', ['-v', 'error', '-ss', '1', '-i', pack.path, '-vf', `crop=2:2:${x}:${y},scale=1:1`, '-frames:v', '1', '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-']).stdout];
+  const centre = pixel(270, 480);
+  assert.ok(Math.abs(centre[0] - 0x7a) < 12 && Math.abs(centre[1] - 0x1f) < 12 && Math.abs(centre[2] - 0x3d) < 12, String(centre));
+  assert.ok(pixel(6, 6).every((channel) => channel < 40));
+  // Regression: a shrinking subject (dolly-out) used to crash ffmpeg when the
+  // shadow was derived from the animated layer. Every move must render.
+  for (const camera of ['dolly-out', 'dolly-in', 'orbit', 'crane-up', 'handheld', 'pan-right']) {
+    const clip = await studio.renderScene({ n: 10, durationSeconds: 2, camera, photo: { path: photo, cutPath: cut } }, context);
+    assert.equal(probeVideo(clip.path).nb_read_frames, '48', camera);
+  }
+  // "cutout: false" keeps the whole photo even when a cut-out exists.
+  assert.equal((await studio.renderScene({ n: 3, durationSeconds: 2, camera: 'dolly-in', photo: { path: photo, cutPath: cut } }, { ...context, cutout: false })).look, 'photo');
+  await assert.rejects(() => studio.renderScene({ n: 4, durationSeconds: 2 }, context), (error) => error.code === 'photo_required');
+});
+
+// ---- built-in storyboard ----
+
+test('storyboard: a long film is planned without a language model, the same way every time', () => {
+  const brief = { brief: 'Один день небольшой кофейни', location: 'стойка у окна', style: 'тёплый свет' };
+  const plan = buildStoryboard(brief, { aspect: '9:16', scenes: 30, durationSeconds: 150 });
+  assert.equal(plan.scenes.length, 30);
+  assert.equal(plan.aspect, '9:16');
+  assert.equal(plan.totalSeconds, 150);
+  assert.equal(plan.scenes[0].camera, 'dolly-in');
+  assert.equal(plan.scenes[29].title.startsWith('Финал'), true);
+  assert.ok(plan.scenes.every((scene) => /Один день небольшой кофейни/.test(scene.prompt) && /тёплый свет/.test(scene.prompt)));
+  // More than one camera move, so the film does not look like a slideshow.
+  assert.ok(new Set(plan.scenes.map((scene) => scene.camera)).size >= 5);
+  assert.equal(buildStoryboard(brief, { aspect: '9:16', scenes: 30, durationSeconds: 150 }).hash, plan.hash);
+
+  // Captions are spread over the whole film, in order.
+  const captioned = applyCaptions(plan, ['Открытие', 'Работа', 'Вечер']);
+  assert.deepEqual(captioned.scenes.map((scene, i) => (scene.onScreenText ? i : null)).filter((i) => i !== null), [0, 10, 20]);
+  assert.equal(applyCaptions(plan, []), plan);
+
+  const reel = buildPhotoReel({ count: 5, secondsPerPhoto: 3 });
+  assert.equal(reel.scenes.length, 5);
+  assert.equal(reel.aspect, '9:16');
+  assert.equal(reel.totalSeconds, 15);
+  assert.equal(buildPhotoReel({ count: 99 }).scenes.length, 36);
 });
 
 // ---- inpaint ----
 
-test('inpaint: not configured names the variables; a request keeps the source intact', async () => {
+test('inpaint: generative modes need the service and name the variables; a request keeps the source intact', async () => {
   const off = createInpainter({});
   assert.deepEqual(off.missing, ['INPAINT_BASE_URL', 'INPAINT_MODEL']);
-  await assert.rejects(() => off.edit({}), (error) => error.code === 'inpaint_not_configured' && error.status === 503);
+  assert.equal(off.capability().builtIn.available, false);
+  await assert.rejects(() => off.edit({ image: PNG_1PX, mask: PNG_1PX, mode: 'replace' }), (error) => error.code === 'inpaint_not_configured' && error.status === 503);
 
   const bodies = [];
   const inpainter = createInpainter({
@@ -655,20 +819,84 @@ test('inpaint: not configured names the variables; a request keeps the source in
       return jsonRes({ image_url: 'https://cdn.example.com/out.png' });
     },
   });
-  const result = await inpainter.edit({ image: PNG_1PX, mask: PNG_1PX, prompt: 'glass jar', reference: PNG_1PX });
+  const result = await inpainter.edit({ image: PNG_1PX, mask: PNG_1PX, prompt: 'glass jar', reference: PNG_1PX, mode: 'replace' });
   assert.equal(result.imageUrl, 'https://cdn.example.com/out.png');
+  assert.equal(result.engine, 'external');
   assert.equal(bodies[0].url, 'https://inpaint.example.com/inpaint');
   assert.equal(bodies[0].body.preserve_unmasked, true);
   assert.equal(bodies[0].body.image, PNG_1PX);
   assert.equal(bodies[0].body.reference, PNG_1PX);
 
   const jpegMask = `data:image/jpeg;base64,${Buffer.concat([Buffer.from([0xff, 0xd8, 0xff]), Buffer.alloc(12)]).toString('base64')}`;
-  await assert.rejects(() => inpainter.edit({ image: PNG_1PX, mask: jpegMask, prompt: 'x' }), (error) => error.code === 'invalid_mask');
-  await assert.rejects(() => inpainter.edit({ image: 'nope', mask: PNG_1PX, prompt: 'x' }), (error) => error.field === 'image');
+  await assert.rejects(() => inpainter.edit({ image: PNG_1PX, mask: jpegMask, prompt: 'x', mode: 'replace' }), (error) => error.code === 'invalid_mask');
+  await assert.rejects(() => inpainter.edit({ image: 'nope', mask: PNG_1PX, prompt: 'x', mode: 'replace' }), (error) => error.field === 'image');
   await assert.rejects(() => inpainter.edit({ image: PNG_1PX, mask: PNG_1PX, prompt: 'x', mode: 'explode' }), (error) => error.code === 'invalid_mode');
+  await assert.rejects(() => inpainter.edit({ image: PNG_1PX, prompt: 'x', mode: 'remove' }), (error) => error.code === 'mask_required');
 
   const bad = createInpainter({ baseUrl: 'https://inpaint.example.com', model: 'm', fetchImpl: async () => jsonRes({ image_url: 'http://insecure/x.png' }) });
-  await assert.rejects(() => bad.edit({ image: PNG_1PX, mask: PNG_1PX, prompt: 'x' }), (error) => error.code === 'inpaint_failed');
+  await assert.rejects(() => bad.edit({ image: PNG_1PX, mask: PNG_1PX, prompt: 'x', mode: 'replace' }), (error) => error.code === 'inpaint_failed');
+});
+
+test('product shots (real ffmpeg): background, insert and erase never repaint the product', { skip: !HAS_FFMPEG }, async () => {
+  const dir = tempDir();
+  const source = productPhoto(path.join(dir, 'p.jpg'));
+  // Mask: transparent canvas with an opaque white rectangle, as the page sends it.
+  const mask = path.join(dir, 'mask.png');
+  ffmpegOk(['-f', 'lavfi', '-i', 'color=c=black@0:s=640x480,format=rgba', '-vf', 'drawbox=x=40:y=60:w=160:h=200:color=white@1:t=fill:replace=1', '-frames:v', '1', mask]);
+  const studio = createStudio({ workDir: dir });
+  // Stand-in for background removal: the product box alone, same canvas size.
+  const cutter = {
+    cutSubject: async (input, output) => {
+      ffmpegOk(['-f', 'lavfi', '-i', 'color=c=black@0:s=640x480,format=rgba', '-vf', 'drawbox=x=260:y=130:w=120:h=220:color=0x7a1f3d@1:t=fill:replace=1', '-frames:v', '1', output]);
+      return { ok: true, box: { x: 260, y: 130, w: 120, h: 220 }, coverage: 0.09 };
+    },
+    adopt: async () => ({ id: 'a'.repeat(64) }),
+  };
+  const editor = createInpainter({ studio, photos: cutter, workDir: path.join(dir, 'edits') });
+  assert.deepEqual(editor.capability().builtIn.modes, ['background', 'insert', 'erase']);
+  assert.equal(editor.configured, true);
+
+  const save = (result, name) => {
+    const file = path.join(dir, name);
+    fs.writeFileSync(file, Buffer.from(result.image.split(',')[1], 'base64'));
+    return file;
+  };
+  const pixel = (file, x, y) => [...spawnSync('ffmpeg', ['-v', 'error', '-i', file, '-vf', `crop=2:2:${x}:${y},scale=1:1`, '-frames:v', '1', '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-']).stdout];
+  const near = (actual, expected, tolerance = 14) => actual.every((channel, i) => Math.abs(channel - expected[i]) <= tolerance);
+  const product = [0x7a, 0x1f, 0x3d];
+  const wall = [0xd8, 0xd2, 0xc8];
+
+  // background: the product keeps its pixels and place, the wall is replaced.
+  const background = await editor.edit({ image: asDataUrl(source), mode: 'background', backdrop: 'dark' }, { userId: 'user-1' });
+  assert.equal(background.engine, 'studio');
+  assert.equal(background.photoId, 'a'.repeat(64));
+  const bgFile = save(background, 'bg.jpg');
+  assert.ok(near(pixel(bgFile, 320, 240), product), String(pixel(bgFile, 320, 240)));
+  assert.ok(pixel(bgFile, 20, 20).every((channel) => channel < 70), String(pixel(bgFile, 20, 20)));
+
+  // insert: the product photo lands inside the mask; the rest is untouched.
+  const reference = path.join(dir, 'ref.png');
+  ffmpegOk(['-f', 'lavfi', '-i', 'color=c=0x1f5a7a:s=100x100', '-frames:v', '1', reference]);
+  const noCut = createInpainter({ studio, photos: { cutSubject: async () => ({ ok: false, reason: 'no_subject' }), adopt: cutter.adopt }, workDir: path.join(dir, 'edits') });
+  const inserted = await noCut.edit({ image: asDataUrl(source), mask: asDataUrl(mask), reference: asDataUrl(reference), mode: 'insert' }, { userId: 'user-1' });
+  assert.deepEqual(inserted.notes, ['reference_background_kept']);
+  const insFile = save(inserted, 'ins.jpg');
+  assert.ok(near(pixel(insFile, 120, 160), [0x1f, 0x5a, 0x7a]), String(pixel(insFile, 120, 160)));
+  assert.ok(near(pixel(insFile, 320, 240), product));
+  assert.ok(near(pixel(insFile, 600, 20), wall));
+
+  // erase: the masked product area is filled from the wall around it.
+  const eraseMask = path.join(dir, 'erase.png');
+  ffmpegOk(['-f', 'lavfi', '-i', 'color=c=black@0:s=640x480,format=rgba', '-vf', 'drawbox=x=240:y=110:w=160:h=260:color=white@1:t=fill:replace=1', '-frames:v', '1', eraseMask]);
+  const erased = save(await editor.edit({ image: asDataUrl(source), mask: asDataUrl(eraseMask), mode: 'erase' }, { userId: 'user-1' }), 'erase.jpg');
+  assert.ok(near(pixel(erased, 320, 240), wall, 20), String(pixel(erased, 320, 240)));
+
+  await assert.rejects(() => editor.edit({ image: asDataUrl(source), mode: 'insert' }, { userId: 'user-1' }), (error) => error.code === 'mask_required');
+  await assert.rejects(() => editor.edit({ image: asDataUrl(source), mask: asDataUrl(mask), mode: 'insert' }, { userId: 'user-1' }), (error) => error.code === 'reference_required');
+  await assert.rejects(() => editor.edit({ image: asDataUrl(source), mode: 'background', backdrop: 'neon' }, { userId: 'user-1' }), (error) => error.code === 'invalid_backdrop');
+  await assert.rejects(() => noCut.edit({ image: asDataUrl(source), mode: 'background' }, { userId: 'user-1' }), (error) => error.code === 'no_subject' && error.status === 422);
+  // Nothing is left behind in the work folder.
+  assert.deepEqual(fs.readdirSync(path.join(dir, 'edits', 'user-1')), []);
 });
 
 // ---- local scene renderer ----
@@ -731,7 +959,7 @@ function fakeBilling() {
   };
 }
 
-async function pipelineFixture({ sky = null, ray = null, runner, planner, upscaler = null, billing = fakeBilling(), storage = null, fetchImpl, now } = {}) {
+async function pipelineFixture({ sky = null, ray = null, runner, planner, upscaler = null, billing = fakeBilling(), storage = null, fetchImpl, now, studioRunner = null, videoModel = true, config = {} } = {}) {
   const workDir = tempDir();
   const db = createMemoryDatabase({ dataDir: tempDir() });
   const user = await db.createUser({ id: '11111111-1111-4111-8111-111111111111', email: 'a@example.com', passwordHash: 'x' });
@@ -760,6 +988,7 @@ async function pipelineFixture({ sky = null, ray = null, runner, planner, upscal
       videoUrlTtlSeconds: 3600,
       filmDriverPath: path.join(workDir, 'driver.py'),
       filmRenderEndpoint: 'https://render.example.com',
+      ...config,
     },
     db,
     storage,
@@ -767,7 +996,8 @@ async function pipelineFixture({ sky = null, ray = null, runner, planner, upscal
     planner: planner === undefined ? { model: 'test-model', writePlan: async () => ({ plan: validatePlan(rawPlan()) }) } : planner,
     ray,
     sky,
-    localPool: sky || ray ? null : createLocalPool({ runner: sceneRunner, concurrency: 4, logger: quiet }),
+    localPool: sky || ray || !videoModel ? null : createLocalPool({ runner: sceneRunner, concurrency: 4, logger: quiet }),
+    studioPool: studioRunner ? createLocalPool({ runner: studioRunner, concurrency: 2, logger: quiet }) : null,
     upscaler,
     composer,
     cache: null,
@@ -811,7 +1041,7 @@ test('pipeline: a 30-scene film runs locally end to end', async () => {
   assert.doesNotMatch(JSON.stringify(view), new RegExp(fx.workDir.replace(/\\/g, '\\\\').slice(0, 12)));
 });
 
-test('pipeline: a template needs no language model and keeps its fixed plan', async () => {
+test('pipeline: a template needs no language model; without SGLang a long film uses the built-in storyboard', async () => {
   const fx = await pipelineFixture({ planner: null });
   const preset = buildPreset({ templateId: 'reels-food', metadata: { niche: 'кофейня', subject: 'капучино', location: 'стойка', style: 'тёплый' } });
   const job = await fx.pipeline.start(fx.user, { templateId: preset.templateId, presetPlan: preset.plan });
@@ -821,8 +1051,22 @@ test('pipeline: a template needs no language model and keeps its fixed plan', as
   assert.equal(done.sceneCount, 3);
   assert.deepEqual(fx.assembled[0].size, { width: 2160, height: 3840 });
   assert.equal(fx.assembled[0].frameRate, 24);
-  // A long film still needs the planner.
-  await assert.rejects(() => fx.pipeline.start(fx.user, { brief: { brief: 'Длинный фильм про кофейню' } }), (error) => error.code === 'planner_not_configured');
+
+  // No planner configured: the film is still made, and says who planned it.
+  const long = await fx.finished((await fx.pipeline.start(fx.user, { brief: { brief: 'Длинный фильм про кофейню' }, scenes: 24, captions: ['Открытие', 'Финал'] })).id);
+  assert.equal(long.status, 'succeeded');
+  assert.equal(long.engine, 'storyboard');
+  assert.equal(long.plan.scenes.length, 24);
+  assert.match(fx.assembled[1].srt, /Открытие[\s\S]*Финал/);
+});
+
+test('pipeline: a planner that is down does not stop the film', async () => {
+  const fx = await pipelineFixture({ planner: { model: 'm', writePlan: async () => { throw Object.assign(new Error('down'), { code: 'sglang_unreachable' }); } } });
+  const done = await fx.finished((await fx.pipeline.start(fx.user, { brief: { brief: 'Фильм, когда модель недоступна' }, scenes: 24 })).id);
+  assert.equal(done.status, 'succeeded');
+  assert.equal(done.engine, 'storyboard');
+  assert.equal(done.infra.plannerFallback, 'sglang_unreachable');
+  assert.deepEqual(fx.billing.events, ['consume', 'record']);
 });
 
 test('pipeline: prompts carry the camera move and the consistency block; photos become first frames', async () => {
@@ -847,6 +1091,88 @@ test('pipeline: prompts carry the camera move and the consistency block; photos 
   assert.equal(first.scene.image, 'data:image/jpeg;base64,AAA');
   assert.equal(seen.find((entry) => entry.scene.n === 2).scene.image, 'data:image/jpeg;base64,BBB');
   assert.equal(seen.find((entry) => entry.scene.n === 3).scene.image, 'data:image/jpeg;base64,AAA');
+});
+
+test('pipeline: own photos are rendered by the built-in studio — no video model, no upscale, any render mode', async () => {
+  const dir = tempDir();
+  const photoA = path.join(dir, 'a.jpg');
+  const photoB = path.join(dir, 'b.jpg');
+  fs.writeFileSync(photoA, 'a');
+  fs.writeFileSync(photoB, 'b');
+  const photos = [{ id: 'a', path: photoA, fullPath: photoA, cutPath: null }, { id: 'b', path: photoB, fullPath: photoB, cutPath: null }];
+  const seen = [];
+  const studioRunner = async (scene, context) => {
+    seen.push({ scene, context });
+    const file = path.join(dir, `studio-${scene.n}.mp4`);
+    fs.writeFileSync(file, 'clip');
+    return { path: file, engine: 'studio' };
+  };
+  const upscaled = [];
+  const upscaler = { upscaleAll: async (clips) => { upscaled.push(clips); return { results: [], failures: [] }; } };
+  const reel = buildPhotoReel({ count: 2, secondsPerPhoto: 3 });
+
+  // 1. No video model at all: the reel is still made.
+  const bare = await pipelineFixture({ videoModel: false, studioRunner, upscaler, planner: null });
+  assert.equal(bare.pipeline.renderMode(), null);
+  const job = await bare.pipeline.start(bare.user, { templateId: 'photo-reel', presetPlan: reel, photos, backdrop: 'dark', cutout: false, captions: ['Новая коллекция'] });
+  const done = await bare.finished(job.id);
+  assert.equal(done.status, 'succeeded', JSON.stringify(done.error));
+  assert.equal(done.engine, 'photo-reel');
+  assert.equal(done.infra.provider, 'studio');
+  // Rendered straight at the final size: nothing to upscale.
+  assert.equal(done.infra.upscaler, 'native');
+  assert.equal(upscaled.length, 0);
+  const first = seen.find((entry) => entry.scene.n === 1);
+  assert.deepEqual(first.context.size, { width: 2160, height: 3840 });
+  assert.equal(first.context.backdrop, 'dark');
+  assert.equal(first.context.cutout, false);
+  assert.equal(first.scene.photo.path, photoA);
+  assert.equal(first.scene.camera, 'dolly-in');
+  assert.equal(first.scene.image, undefined);
+  assert.equal(seen.find((entry) => entry.scene.n === 2).scene.photo.path, photoB);
+  assert.match(bare.assembled[0].srt, /Новая коллекция/);
+  // Without photos there is nothing to shoot, and nothing is charged.
+  await assert.rejects(() => bare.pipeline.start(bare.user, { brief: { brief: 'Фильм без фото и без модели' } }), (error) => error.code === 'render_not_configured' && /фото/.test(error.message));
+  assert.deepEqual(bare.billing.events, ['consume', 'record']);
+
+  // 2. On a cluster deployment photos no longer fail: the studio renders them here.
+  const sky = fakeSky();
+  const cluster = await pipelineFixture({ sky, studioRunner, planner: null });
+  assert.equal(cluster.pipeline.renderMode(), 'sky');
+  const onCluster = await cluster.finished((await cluster.pipeline.start(cluster.user, { templateId: 'photo-reel', presetPlan: reel, photos })).id);
+  assert.equal(onCluster.status, 'succeeded');
+  assert.equal(onCluster.infra.provider, 'studio');
+  assert.equal(sky.calls.run.length, 0);
+  await assert.rejects(() => cluster.pipeline.start(cluster.user, { templateId: 'photo-reel', presetPlan: reel, photos, photoMode: 'ai' }), (error) => error.code === 'photos_need_local_render');
+
+  // 3. With a video model on this host the buyer chooses: studio or the model.
+  const local = await pipelineFixture({ studioRunner });
+  assert.equal(local.pipeline.modeFor(photos, undefined), 'local');
+  assert.equal(local.pipeline.modeFor(photos, 'studio'), 'studio');
+  assert.equal(local.pipeline.modeFor(photos, 'ai'), 'local');
+  assert.equal(local.pipeline.modeFor([], 'studio'), 'local');
+});
+
+test('pipeline: FILM_STUDIO_FREE makes studio reels free; a failed studio scene still fails the job', async () => {
+  const dir = tempDir();
+  const photo = path.join(dir, 'a.jpg');
+  fs.writeFileSync(photo, 'a');
+  const photos = [{ id: 'a', path: photo, fullPath: photo, cutPath: null }];
+  const reel = buildPhotoReel({ count: 1 });
+  const ok = async (scene) => {
+    const file = path.join(dir, `s-${scene.n}.mp4`);
+    fs.writeFileSync(file, 'clip');
+    return { path: file };
+  };
+  const free = await pipelineFixture({ videoModel: false, studioRunner: ok, planner: null, config: { filmStudioFree: true } });
+  assert.equal((await free.finished((await free.pipeline.start(free.user, { templateId: 'photo-reel', presetPlan: reel, photos })).id)).status, 'succeeded');
+  assert.deepEqual(free.billing.events, []);
+
+  const broken = await pipelineFixture({ videoModel: false, planner: null, studioRunner: async () => { throw Object.assign(new Error('boom'), { code: 'studio_render_failed' }); } });
+  const failed = await broken.finished((await broken.pipeline.start(broken.user, { templateId: 'photo-reel', presetPlan: reel, photos })).id);
+  assert.equal(failed.status, 'failed');
+  assert.equal(failed.error.code, 'scenes_failed');
+  assert.deepEqual(broken.billing.events, ['consume', 'record', 'refund']);
 });
 
 test('pipeline: a failed scene fails the job, names the scene and refunds', async () => {
@@ -981,7 +1307,7 @@ test('pipeline: input is validated before anything is charged', async () => {
   const off = createFilmPipeline({ config: { ...filmConfig({}), filmEnabled: false }, db: fx.db, logger: quiet });
   await assert.rejects(() => off.start(fx.user, { brief: { brief: 'Нормальное описание фильма' } }), (error) => error.code === 'film_disabled');
   const noRender = createFilmPipeline({ config: { ...filmConfig({}), filmEnabled: true }, db: fx.db, planner: { model: 'm' }, logger: quiet });
-  await assert.rejects(() => noRender.start(fx.user, { brief: { brief: 'Нормальное описание фильма' } }), (error) => error.code === 'render_not_configured');
+  await assert.rejects(() => noRender.start(fx.user, { brief: { brief: 'Нормальное описание фильма' } }), (error) => error.code === 'render_not_configured' && error.status === 503);
 });
 
 test('pipeline: music and voiceover reach the assembler; expired films are cleaned up', async () => {
@@ -1012,23 +1338,70 @@ test('pipeline: music and voiceover reach the assembler; expired films are clean
   assert.equal(await fx.pipeline.cleanup(), 0);
 });
 
+test('load: an account has a cap on films in progress; studio renders share one queue', async () => {
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const fx = await pipelineFixture({ runner: async (scene, context) => {
+    await gate;
+    const file = path.join(fx.workDir, context.jobId, `s-${scene.n}.mp4`);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, 'clip');
+    return { path: file };
+  } });
+  const input = () => ({ brief: { brief: 'Фильм для проверки очереди' }, scenes: 24 });
+  const first = await fx.pipeline.start(fx.user, input());
+  const second = await fx.pipeline.start(fx.user, input());
+  // The third is refused before anything is charged.
+  await assert.rejects(() => fx.pipeline.start(fx.user, input()), (error) => error.code === 'too_many_active' && error.status === 429);
+  assert.deepEqual(fx.billing.events, ['consume', 'record', 'consume', 'record']);
+  release();
+  assert.equal((await fx.finished(first.id)).status, 'succeeded');
+  assert.equal((await fx.finished(second.id)).status, 'succeeded');
+  assert.equal((await fx.finished((await fx.pipeline.start(fx.user, input())).id)).status, 'succeeded');
+
+  // limited(): never more than `max` at once, every call completes, errors pass through.
+  let active = 0;
+  let peak = 0;
+  const work = limited(async (value) => {
+    active += 1;
+    peak = Math.max(peak, active);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    active -= 1;
+    if (value === 3) throw new Error('three');
+    return value * 2;
+  }, 2);
+  const results = await Promise.allSettled([1, 2, 3, 4, 5, 6].map((value) => work(value)));
+  assert.equal(peak, 2);
+  assert.deepEqual(results.map((item) => (item.status === 'fulfilled' ? item.value : item.reason.message)), [2, 4, 'three', 8, 10, 12]);
+});
+
 // ---- configuration ----
 
-test('config: everything is off by default and reports what is missing', () => {
+test('config: paid engines are off by default; the built-in ones are always there', () => {
   const config = filmConfig({});
   assert.equal(config.filmEnabled, false);
   assert.equal(config.skypilot.dryRun, true);
   assert.equal(config.skypilot.maxHourlyUsd, 0);
   assert.equal(config.filmBaseResolution, '480p');
+  assert.equal(config.filmStudioFree, false);
+  assert.equal(config.filmRembgModel, 'u2netp');
   assert.equal(filmConfig({ FILM_BASE_RESOLUTION: '8k' }).filmBaseResolution, '480p');
 
   const db = createMemoryDatabase({ dataDir: tempDir() });
-  const stack = createFilmStack({ ...config, filmEnabled: true, filmWorkDir: tempDir(), filmCacheDir: tempDir() }, { db, logger: quiet });
+  const stack = createFilmStack({ ...config, filmEnabled: true, filmWorkDir: tempDir(), filmCacheDir: tempDir() }, { db, logger: quiet, runners: { env: NO_PATH } });
   const caps = stack.capabilities();
-  assert.deepEqual(caps.planner.missing, ['SGLANG_BASE_URL', 'SGLANG_MODEL']);
+  // Planning and the studio need nothing; the upgrades name their variables.
+  assert.deepEqual([caps.planner.engine, caps.planner.configured, caps.planner.missing], ['storyboard', true, []]);
+  assert.deepEqual(caps.planner.upgrade, ['SGLANG_BASE_URL', 'SGLANG_MODEL']);
+  assert.equal(caps.studio.available, true);
+  assert.ok(caps.studio.backdrops.length >= 5);
   assert.equal(caps.render.mode, null);
+  assert.deepEqual(caps.render.missing, ['SEEDANCE_API_KEY', 'RAY_DASHBOARD_URL', 'SKYPILOT_ENABLED']);
   assert.equal(caps.upscaler.engine, 'ffmpeg-lanczos');
-  assert.deepEqual(caps.inpaint.missing, ['INPAINT_BASE_URL', 'INPAINT_MODEL']);
+  assert.equal(caps.inpaint.configured, true);
+  assert.deepEqual(caps.inpaint.builtIn.modes, ['background', 'insert', 'erase']);
+  assert.deepEqual(caps.inpaint.generative.missing, ['INPAINT_BASE_URL', 'INPAINT_MODEL']);
+  assert.deepEqual(caps.photos.missing, ['FILM_REMOVE_BG_COMMAND']);
   // Only variable names are reported.
   assert.doesNotMatch(JSON.stringify(caps), /https?:\/\//);
 });
@@ -1147,16 +1520,59 @@ test('http: validation errors are specific; nothing is charged for a rejected re
 
     const noStyle = await api.post('/api/film/jobs', { templateId: 'reels-food', metadata: { niche: 'кафе', subject: 'кофе', location: 'зал' } });
     assert.deepEqual([noStyle.status, noStyle.json.error, noStyle.json.field], [400, 'metadata_required', 'style']);
-    // A long film needs SGLang, which is not configured here.
-    const long = await api.post('/api/film/jobs', { brief: 'Один день небольшой кофейни', scenes: 30 });
-    assert.deepEqual([long.status, long.json.error], [503, 'planner_not_configured']);
+    const short = await api.post('/api/film/jobs', { brief: 'кофе', scenes: 30 });
+    assert.deepEqual([short.status, short.json.error], [400, 'brief_required']);
+    const reel = await api.post('/api/film/jobs', { photoReel: true });
+    assert.deepEqual([reel.status, reel.json.error, reel.json.field], [400, 'photos_required', 'photoIds']);
     assert.equal((await api.post('/api/film/jobs', { templateId: 'reels-food', metadata: { niche: 'кафе', subject: 'кофе', location: 'зал', style: 'тёплый' }, audio: { trackId: 'nope' } })).json.error, 'unknown_track');
     assert.equal((await api.post('/api/film/jobs', { templateId: 'reels-food', metadata: { niche: 'кафе', subject: 'кофе', location: 'зал', style: 'тёплый' }, photoIds: ['../../x'] })).json.error, 'unknown_photo');
     assert.equal((await api.post('/api/film/audio/link', { url: 'https://evil.example/x' })).json.error, 'host_not_allowed');
-    assert.equal((await api.post('/api/film/inpaint', { image: PNG_1PX, mask: PNG_1PX, prompt: 'x' })).status, 503);
+    // Generative modes need the external service; the built-in ones need an area.
+    const generative = await api.post('/api/film/inpaint', { image: PNG_1PX, mask: PNG_1PX, prompt: 'x', mode: 'replace' });
+    assert.deepEqual([generative.status, generative.json.error], [503, 'inpaint_not_configured']);
+    assert.equal((await api.post('/api/film/inpaint', { image: PNG_1PX, mode: 'insert' })).json.error, 'mask_required');
+    assert.equal((await api.post('/api/film/inpaint', { image: PNG_1PX, mode: 'paint' })).json.error, 'invalid_mode');
     assert.equal((await api.post('/api/film/photos/prepare', { photos: [] })).status, 400);
     assert.equal((await api.get('/api/film/jobs/not-a-uuid')).status, 404);
     assert.equal((await api.get('/api/film/unknown')).status, 404);
     assert.equal((await app.db.getUserById(userId)).credits, 2);
+  });
+});
+
+test('http (real ffmpeg): photos in, finished vertical reel out — no video model, no language model, no storage', { skip: !HAS_FFMPEG, timeout: 180000 }, async () => {
+  const dir = tempDir();
+  const options = filmServerOptions(fakeServices(), { film: { filmTargetResolution: '1080p', filmStudioFree: true, photoSteps: { removeBg: 'off', enhance: '' } } });
+  options.seedance = { apiKey: '' };
+  options.s3 = { endpoint: '', bucket: '', accessKeyId: '', secretAccessKey: '' };
+  await withServer(options, async ({ base, app }) => {
+    const api = accountClient(base);
+    const userId = (await api.register('studio@example.com')).json.user.id;
+    const caps = (await api.get('/api/film/capabilities')).json;
+    assert.equal(caps.render.mode, null);
+    assert.equal(caps.studio.free, true);
+
+    const prepared = await api.post('/api/film/photos/prepare', { photos: [asDataUrl(productPhoto(path.join(dir, 'a.jpg'))), asDataUrl(productPhoto(path.join(dir, 'b.jpg'), '480x640'))] });
+    assert.equal(prepared.status, 201, JSON.stringify(prepared.json));
+    assert.equal(prepared.json.photos.length, 2);
+
+    // A Free account with no credits: a studio reel is not charged.
+    const created = await api.post('/api/film/jobs', { photoReel: true, photoIds: prepared.json.photos.map((photo) => photo.id), secondsPerPhoto: 2, captions: 'Новая коллекция\nУже в продаже' });
+    assert.equal(created.status, 201, JSON.stringify(created.json));
+    let job;
+    for (let i = 0; i < 1500; i += 1) {
+      job = (await api.get(`/api/film/jobs/${created.json.job.id}`)).json.job;
+      if (!['queued', 'planning', 'rendering', 'upscaling', 'assembling'].includes(job.status)) break;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    assert.equal(job.status, 'succeeded', JSON.stringify(job.error));
+    assert.deepEqual([job.engine, job.infra.provider, job.infra.upscaler, job.infra.subtitleCues], ['photo-reel', 'studio', 'native', 2]);
+    assert.equal((await app.db.getUserById(userId)).credits, 0);
+
+    const response = await fetch(`${base}${job.video.download}`, { headers: { Authorization: `Bearer ${api.state.token}` } });
+    assert.equal(response.status, 200);
+    const file = path.join(dir, 'reel.mp4');
+    fs.writeFileSync(file, Buffer.from(await response.arrayBuffer()));
+    const video = probeVideo(file);
+    assert.deepEqual([video.codec_name, video.width, video.height, video.nb_read_frames], ['h264', 1080, 1920, '96']);
   });
 });

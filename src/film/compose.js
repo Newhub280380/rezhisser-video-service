@@ -145,7 +145,7 @@ function run(bin, args, { cwd, timeoutMs = 3600000, capture = false } = {}) {
   return new Promise((resolve) => {
     let child;
     try {
-      child = spawn(bin, args, { cwd, stdio: ['ignore', capture ? 'pipe' : 'ignore', 'pipe'] });
+      child = spawn(bin, args, { cwd, stdio: ['ignore', capture ? 'pipe' : 'ignore', 'pipe'], windowsHide: true });
     } catch {
       resolve({ ok: false, code: 'tool_missing', stdout: '', stderr: '' });
       return;

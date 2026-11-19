@@ -2,9 +2,12 @@
 
 // Builds the film pipeline from environment configuration.
 //
-// Fail-closed, like the rest of the service: a stage either has a real adapter
-// or is reported as not configured, with the names of the missing variables
-// (names only, never values).
+// The main scenario works with nothing but ffmpeg on the host: reels from the
+// buyer's own photos (built-in studio), long-film planning (built-in
+// storyboard), photo clean-up, product shots, subtitles and the final mix.
+// Everything beyond that — a generative video model, SGLang, a GPU cluster,
+// ReCaVSR — is an upgrade that either has a real adapter or is reported as not
+// connected, with the names of the missing variables (names only, never values).
 
 const path = require('node:path');
 const { createSglangPlanner } = require('./sglang.js');
@@ -18,6 +21,7 @@ const { createPhotoPipeline } = require('./photos.js');
 const { createSceneRenderer } = require('./render.js');
 const { createCache } = require('./cache.js');
 const { createFilmPipeline } = require('./jobs.js');
+const { createStudio, listBackdrops } = require('./studio.js');
 const { MIN_SCENES, MAX_SCENES, BASE_RESOLUTIONS, TARGET_RESOLUTIONS } = require('./schema.js');
 
 function int(value, fallback, min, max) {
@@ -37,6 +41,25 @@ function list(value) {
 function flag(value, fallback) {
   if (value === undefined || value === '') return fallback;
   return ['1', 'true', 'yes', 'on'].includes(String(value).trim().toLowerCase());
+}
+
+// Caps how many calls of `fn` run at once across all jobs; the rest wait.
+function limited(fn, max) {
+  let active = 0;
+  const waiting = [];
+  const next = () => {
+    if (active >= max || !waiting.length) return;
+    active += 1;
+    const { args, resolve, reject } = waiting.shift();
+    Promise.resolve().then(() => fn(...args)).then(resolve, reject).finally(() => {
+      active -= 1;
+      next();
+    });
+  };
+  return (...args) => new Promise((resolve, reject) => {
+    waiting.push({ args, resolve, reject });
+    next();
+  });
 }
 
 function filmConfig(env = process.env) {
@@ -60,6 +83,14 @@ function filmConfig(env = process.env) {
     // profiles list 5 and 10 seconds).
     filmSceneDurations: durations.length ? durations : [5, 10],
     filmLocalConcurrency: int(env.FILM_LOCAL_CONCURRENCY, 4, 1, 16),
+    // ffmpeg already uses every core for one clip; two at a time keeps a
+    // desktop responsive.
+    filmStudioConcurrency: int(env.FILM_STUDIO_CONCURRENCY, 2, 1, 8),
+    // Studio reels cost nothing to render; when on, they do not consume the
+    // account's generations.
+    filmStudioFree: flag(env.FILM_STUDIO_FREE, false),
+    // Films one account may have in progress at the same time.
+    filmMaxActivePerUser: int(env.FILM_MAX_ACTIVE_PER_USER, 2, 1, 50),
     // Render service the cluster driver calls for every scene.
     filmRenderEndpoint: (env.FILM_RENDER_ENDPOINT || '').trim(),
     filmDriverPath: path.join(__dirname, '..', '..', 'python', 'rezhisser_film', 'film_job.py'),
@@ -99,6 +130,7 @@ function filmConfig(env = process.env) {
       removeBg: (env.FILM_REMOVE_BG_COMMAND || '').trim(),
       enhance: (env.FILM_ENHANCE_COMMAND || '').trim(),
     },
+    filmRembgModel: (env.FILM_REMBG_MODEL || 'u2netp').trim(),
     composer: {
       ffmpegBin: env.FFMPEG_BIN || 'ffmpeg',
       ffprobeBin: env.FFPROBE_BIN || 'ffprobe',
@@ -131,6 +163,10 @@ function createFilmStack(config, { db, storage = null, billing = null, seedance 
   });
   const sceneRunner = runners.scene || (renderer ? renderer.renderScene : null);
   const localPool = sceneRunner ? createLocalPool({ runner: sceneRunner, concurrency: config.filmLocalConcurrency, logger }) : null;
+  const studio = createStudio({ ffmpegBin: config.composer.ffmpegBin, ffprobeBin: config.composer.ffprobeBin, workDir: config.filmWorkDir, ...processRunner });
+  // The limit is shared by every job, so ten buyers at once queue up instead
+  // of starting twenty encoders.
+  const studioPool = createLocalPool({ runner: limited(runners.studio || studio.renderScene, config.filmStudioConcurrency), concurrency: config.filmStudioConcurrency, logger });
   const upscaler = createUpscaler({ ...config.recavsr, logger, ...processRunner });
   const composer = createComposer({ ...config.composer, workDir: config.filmWorkDir, burnSubtitles: config.filmSubtitles, ...processRunner });
   const audio = createAudio({
@@ -146,25 +182,41 @@ function createFilmStack(config, { db, storage = null, billing = null, seedance 
     workDir: path.join(config.filmWorkDir, 'photos'),
     ffmpegBin: config.composer.ffmpegBin,
     steps: config.photoSteps,
+    rembgModel: config.filmRembgModel,
+    ...(runners.env ? { env: runners.env } : {}),
     ...processRunner,
   });
-  const inpainter = createInpainter({ ...config.inpaint, fetchImpl });
+  const inpainter = createInpainter({
+    ...config.inpaint,
+    fetchImpl,
+    studio,
+    photos,
+    workDir: path.join(config.filmWorkDir, 'edits'),
+    ffmpegBin: config.composer.ffmpegBin,
+    ...processRunner,
+  });
   const cache = createCache({ dir: config.filmCacheDir });
-  const pipeline = createFilmPipeline({ config, db, storage, billing, planner, ray, sky, localPool, upscaler, composer, cache, fetchImpl, logger });
+  const pipeline = createFilmPipeline({ config, db, storage, billing, planner, ray, sky, localPool, studioPool, upscaler, composer, cache, fetchImpl, logger });
 
   // What works right now. Variable names only, never values.
   function capabilities() {
     const mode = pipeline.renderMode();
     return {
       enabled: config.filmEnabled,
+      // Long films are always planned: by SGLang when it is connected, by the
+      // built-in storyboard otherwise.
       planner: {
-        engine: 'sglang',
-        configured: Boolean(planner),
-        missing: [config.sglang.baseUrl ? '' : 'SGLANG_BASE_URL', config.sglang.model ? '' : 'SGLANG_MODEL'].filter(Boolean),
+        engine: planner ? 'sglang' : 'storyboard',
+        configured: true,
+        upgrade: planner ? [] : [config.sglang.baseUrl ? '' : 'SGLANG_BASE_URL', config.sglang.model ? '' : 'SGLANG_MODEL'].filter(Boolean),
+        missing: [],
       },
+      // Reels from the buyer's own photos, rendered on this host.
+      studio: { available: true, engine: 'ffmpeg', backdrops: listBackdrops(), concurrency: config.filmStudioConcurrency, free: config.filmStudioFree },
+      // Generating scenes from text needs a video model.
       render: {
         mode,
-        missing: mode ? [] : ['RAY_DASHBOARD_URL', 'SKYPILOT_ENABLED', 'SEEDANCE_API_KEY'],
+        missing: mode ? [] : ['SEEDANCE_API_KEY', 'RAY_DASHBOARD_URL', 'SKYPILOT_ENABLED'],
       },
       infra: { provider: 'skypilot', enabled: sky.enabled, dryRun: sky.dryRun, spot: sky.useSpot, priceCeilingSet: sky.maxHourlyUsd > 0 },
       upscaler: {
@@ -174,13 +226,13 @@ function createFilmStack(config, { db, storage = null, billing = null, seedance 
       },
       audio: audio.capability(),
       photos: photos.capability(),
-      inpaint: { configured: inpainter.configured, missing: inpainter.missing },
+      inpaint: inpainter.capability(),
       cache: { enabled: cache.enabled },
       limits: { minScenes: MIN_SCENES, maxScenes: MAX_SCENES },
     };
   }
 
-  return { pipeline, planner, ray, sky, localPool, upscaler, composer, audio, photos, inpainter, cache, capabilities };
+  return { pipeline, planner, ray, sky, localPool, studio, studioPool, upscaler, composer, audio, photos, inpainter, cache, capabilities };
 }
 
-module.exports = { filmConfig, createFilmStack };
+module.exports = { filmConfig, createFilmStack, limited };

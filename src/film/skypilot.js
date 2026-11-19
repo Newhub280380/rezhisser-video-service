@@ -43,7 +43,7 @@ function runCli(bin, args, { timeoutMs = 120000, env = {}, onLine = null, signal
   return new Promise((resolve) => {
     let child;
     try {
-      child = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, ...env } });
+      child = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, ...env }, windowsHide: true });
     } catch (error) {
       resolve({ ok: false, code: 'cli_missing', stdout: '', stderr: String(error.message || ''), status: null });
       return;

@@ -12,6 +12,8 @@ const { listTemplates, buildPreset, TemplateError } = require('./templates.js');
 const { PlanError, cleanText } = require('./schema.js');
 const { FilmError } = require('./jobs.js');
 const { PhotoError } = require('./photos.js');
+const { buildPhotoReel } = require('./storyboard.js');
+const { ASPECTS } = require('./schema.js');
 const { InpaintError } = require('./inpaint.js');
 const { AudioError } = require('./audio.js');
 
@@ -22,6 +24,8 @@ const PHOTO_BODY = 14 * 1024 * 1024;
 const MAX_PHOTOS_PER_REQUEST = 6;
 const NO_STORE = { 'Cache-Control': 'no-store' };
 const BRIEF_FIELDS = { brief: 900, niche: 120, subject: 120, location: 120, style: 200, audience: 200, music: 120 };
+const MAX_CAPTIONS = 36;
+const PHOTO_MODES = ['studio', 'ai'];
 const ACCOUNT_PATHS = ['/api/film/jobs', '/api/film/audio/library', '/api/film/audio/link', '/api/film/photos/prepare', '/api/film/inpaint'];
 
 function knownError(error) {
@@ -42,6 +46,12 @@ function normalizeBrief(value) {
   return brief;
 }
 
+// Caption lines: an array, or one text with a line per caption.
+function normalizeCaptions(value) {
+  const lines = Array.isArray(value) ? value : typeof value === 'string' ? value.split(/\r?\n/) : [];
+  return lines.map((line) => cleanText(String(line), 200)).filter(Boolean).slice(0, MAX_CAPTIONS);
+}
+
 function createFilmApi({ config, stack, db, helpers, logger = console }) {
   const { sendJson, readJson, requireUser } = helpers;
   const { pipeline, photos, inpainter, audio } = stack;
@@ -56,8 +66,27 @@ function createFilmApi({ config, stack, db, helpers, logger = console }) {
       aspect: payload.aspect,
       audio: audio.resolve(user.id, payload.audio),
       voice: audio.resolve(user.id, payload.voice),
+      captions: normalizeCaptions(payload.captions),
+      photoMode: PHOTO_MODES.includes(payload.photoMode) ? payload.photoMode : undefined,
+      backdrop: typeof payload.backdrop === 'string' ? payload.backdrop : undefined,
+      cutout: payload.cutout === false ? false : undefined,
     };
-    if (payload.templateId !== undefined && payload.templateId !== null) {
+    const reelPhotos = Array.isArray(payload.photoIds) ? payload.photoIds.length : 0;
+    if (payload.photoReel === true) {
+      // One scene per photo; nothing to describe.
+      if (!reelPhotos) throw new PhotoError('photos_required', 'Сначала подготовьте фото.', 'photoIds');
+      input.templateId = 'photo-reel';
+      input.presetPlan = buildPhotoReel({
+        count: reelPhotos,
+        aspect: ASPECTS.includes(payload.aspect) ? payload.aspect : '9:16',
+        secondsPerPhoto: payload.secondsPerPhoto,
+        title: typeof payload.title === 'string' ? payload.title : '',
+        style: typeof payload.style === 'string' ? payload.style : '',
+      });
+      input.scenes = undefined;
+      // The studio is the default here: the photos stay exactly as shot.
+      if (!input.photoMode) input.photoMode = 'studio';
+    } else if (payload.templateId !== undefined && payload.templateId !== null) {
       const preset = buildPreset({ templateId: payload.templateId, metadata: payload.metadata });
       input.templateId = preset.templateId;
       input.presetPlan = preset.plan;
@@ -66,10 +95,9 @@ function createFilmApi({ config, stack, db, helpers, logger = console }) {
       input.brief = normalizeBrief(payload.brief);
     }
     if (Array.isArray(payload.photoIds) && payload.photoIds.length) {
-      // Prepared photos become the first frames of the scenes.
-      input.photos = photos
-        .resolve(user.id, payload.photoIds)
-        .map((photo) => `data:image/jpeg;base64,${fs.readFileSync(photo.path).toString('base64')}`);
+      // Prepared photos become the scenes: files for the built-in studio,
+      // first frames for a video model.
+      input.photos = photos.resolve(user.id, payload.photoIds);
     }
     const job = await pipeline.start(user, input);
     sendJson(res, 201, { job: pipeline.publicJob(job) }, NO_STORE);
@@ -185,8 +213,10 @@ function createFilmApi({ config, stack, db, helpers, logger = console }) {
         prompt: payload.prompt,
         mode: payload.mode,
         reference: payload.reference || null,
+        background: payload.background || null,
+        backdrop: typeof payload.backdrop === 'string' && payload.backdrop ? payload.backdrop : null,
         seed: Number.isInteger(payload.seed) ? payload.seed : null,
-      });
+      }, { userId: user.id });
       sendJson(res, 201, { result }, NO_STORE);
       return true;
     }
@@ -210,4 +240,4 @@ function createFilmApi({ config, stack, db, helpers, logger = console }) {
   return { handle };
 }
 
-module.exports = { createFilmApi, normalizeBrief, MAX_PHOTOS_PER_REQUEST };
+module.exports = { createFilmApi, normalizeBrief, normalizeCaptions, MAX_PHOTOS_PER_REQUEST };

@@ -5,8 +5,11 @@
 //
 // Rules this file enforces:
 //
-// * Nothing is invented. No planner, no renderer or a failed scene means a
-//   failed job with the reason, never a placeholder film.
+// * Nothing is faked. A failed scene means a failed job with the reason, never
+//   a placeholder film, and every job names the engines that really ran.
+// * The main scenario has no external dependency: a reel from the buyer's own
+//   photos is rendered by the built-in studio (ffmpeg), and a long film is
+//   planned by the built-in storyboard when no language model is connected.
 // * A rented cluster is always torn down in `finally`. If teardown fails the job
 //   is flagged `needs_attention` (the finished film stays downloadable).
 // * A failed or canceled job returns the reserved generation to the account.
@@ -20,6 +23,7 @@ const { validatePlan, outputSize, ASPECTS, MIN_SCENES, MAX_SCENES } = require('.
 const { buildSubtitles } = require('./compose.js');
 const { consistencyPrompt } = require('./photos.js');
 const { downloadClip } = require('./render.js');
+const { buildStoryboard, applyCaptions } = require('./storyboard.js');
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const ACTIVE_STATUSES = ['queued', 'planning', 'provisioning', 'rendering', 'upscaling', 'assembling'];
@@ -56,6 +60,7 @@ function createFilmPipeline({
   ray = null,
   sky = null,
   localPool = null,
+  studioPool = null,
   upscaler = null,
   composer = null,
   cache = null,
@@ -66,11 +71,28 @@ function createFilmPipeline({
   const running = new Map();
   const driverPath = config.filmDriverPath;
 
-  // Which engine renders scenes, in order of preference.
+  // Which generative engine renders scenes, in order of preference.
   function renderMode() {
     if (ray) return 'ray';
     if (sky && sky.enabled && !sky.dryRun) return 'sky';
     if (localPool) return 'local';
+    return null;
+  }
+
+  // Engine for one job. With photos the built-in studio is always available;
+  // a video model animates them only when it runs on this host and the buyer
+  // did not ask for the studio.
+  function modeFor(photos, photoMode) {
+    const mode = renderMode();
+    if (!photos.length) return mode;
+    const filesOnDisk = photos.every((photo) => photo && photo.path);
+    if (photoMode === 'ai') {
+      if (mode !== 'local') throw new FilmError('photos_need_local_render', 'Оживление фото нейросетью доступно только с локальным видеодвижком. Выберите режим «Студия».', 409);
+      return 'local';
+    }
+    if (studioPool && filesOnDisk && (photoMode === 'studio' || mode !== 'local')) return 'studio';
+    if (mode === 'local') return 'local';
+    if (mode) throw new FilmError('photos_need_local_render', 'Ролик по своим фото недоступен с кластерным рендером без встроенной студии.', 409);
     return null;
   }
 
@@ -118,21 +140,33 @@ function createFilmPipeline({
 
   async function planStage(job, input) {
     await patch(job.id, { status: 'planning', stage: 'plan' });
+    const planned = await writePlan(job, input);
+    return { ...planned, plan: applyCaptions(planned.plan, input.captions) };
+  }
+
+  async function writePlan(job, input) {
     // A template is a fixed storyboard: no model is asked, so the same four
     // answers always give the same plan.
     if (input.presetPlan) {
       const count = input.presetPlan.scenes.length;
-      return { plan: validatePlan(input.presetPlan, { aspect: job.aspect, minScenes: count, maxScenes: count }), engine: 'template' };
+      return { plan: validatePlan(input.presetPlan, { aspect: job.aspect, minScenes: count, maxScenes: count }), engine: job.templateId === 'photo-reel' ? 'photo-reel' : 'template' };
     }
-    if (!planner) throw new FilmError('planner_not_configured', 'SGLang не настроен: задайте SGLANG_BASE_URL и SGLANG_MODEL.', 503);
     const options = { aspect: job.aspect, scenes: job.sceneCount, durationSeconds: input.durationSeconds };
+    if (!planner) return { plan: buildStoryboard(input.brief, options), engine: 'storyboard' };
     const key = cache && cache.enabled ? cache.key('plan', { brief: input.brief, options, model: planner.model }) : null;
     const hit = key ? cache.get(key) : null;
     // A cached plan is validated again: an old shape must never reach a renderer.
     if (hit) return { plan: validatePlan(hit, { aspect: job.aspect }), engine: 'sglang-cache' };
-    const { plan } = await planner.writePlan(input.brief, options);
-    if (key) cache.set(key, plan);
-    return { plan, engine: 'sglang' };
+    try {
+      const { plan } = await planner.writePlan(input.brief, options);
+      if (key) cache.set(key, plan);
+      return { plan, engine: 'sglang' };
+    } catch (error) {
+      // A language model that is down must not stop the film: the built-in
+      // storyboard takes over and the job says which one wrote the plan.
+      logger.error(`film job ${job.id} planner failed: ${error.code || 'error'}; using the built-in storyboard`);
+      return { plan: buildStoryboard(input.brief, options), engine: 'storyboard', fallback: error.code || 'planner_failed' };
+    }
   }
 
   // The video provider accepts only certain clip lengths; the plan is aligned
@@ -146,13 +180,21 @@ function createFilmPipeline({
 
   // ---- render -------------------------------------------------------------
 
-  function renderPayload(job, plan, photos) {
+  function firstFrame(photo) {
+    if (typeof photo === 'string') return photo;
+    if (photo.dataUrl) return photo.dataUrl;
+    return `data:image/jpeg;base64,${fs.readFileSync(photo.path).toString('base64')}`;
+  }
+
+  function renderPayload(job, plan, photos, mode, look = {}) {
     const identity = consistencyPrompt({ characters: plan.characters, locations: plan.locations, style: plan.style });
     return {
       jobId: job.id,
       fps: plan.fps,
       aspect: plan.aspect,
       resolution: job.baseResolution,
+      // The studio renders straight at the final size.
+      ...(mode === 'studio' ? { size: outputSize(plan.aspect, job.targetResolution), style: plan.style, backdrop: look.backdrop, cutout: look.cutout } : {}),
       shots: plan.scenes.map((scene, index) => ({
         shotId: `${job.id}:${scene.n}`,
         n: scene.n,
@@ -161,13 +203,14 @@ function createFilmPipeline({
         durationSeconds: scene.durationSeconds,
         // "Film from your photos": each scene starts from one of the prepared
         // photos (first frame), cycling through them in order.
-        ...(photos.length ? { image: photos[index % photos.length] } : {}),
+        ...(photos.length && mode === 'studio' ? { camera: scene.camera, photo: photos[index % photos.length] } : {}),
+        ...(photos.length && mode !== 'studio' ? { image: firstFrame(photos[index % photos.length]) } : {}),
       })),
     };
   }
 
-  async function renderStage(job, plan, mode, photos, signal, state) {
-    const payload = renderPayload(job, plan, photos);
+  async function renderStage(job, plan, mode, photos, signal, state, look) {
+    const payload = renderPayload(job, plan, photos, mode, look);
     const onProgress = (progress) => {
       const done = Number(progress && progress.done) || 0;
       const total = Number(progress && progress.total) || payload.shots.length;
@@ -207,7 +250,7 @@ function createFilmPipeline({
       });
     } else {
       await patch(job.id, { status: 'rendering', stage: 'render', infra: { provider: mode } });
-      result = await (mode === 'ray' ? ray : localPool).run(payload, { onProgress, signal });
+      result = await (mode === 'ray' ? ray : mode === 'studio' ? studioPool : localPool).run(payload, { onProgress, signal });
     }
 
     const rendered = new Map();
@@ -223,7 +266,7 @@ function createFilmPipeline({
       let file = null;
       let error = failed.get(shot.sceneNumber) || { code: 'missing_output' };
       try {
-        if (out && mode === 'local' && out.path && fs.existsSync(out.path)) file = out.path;
+        if (out && (mode === 'local' || mode === 'studio') && out.path && fs.existsSync(out.path)) file = out.path;
         // A cluster's local path means nothing here: remote clips need a URL.
         else if (out && out.url) file = (await downloadClip(out.url, path.join(dir, `scene-${shot.sceneNumber}.mp4`), { fetchImpl })).path;
         else if (out) error = { code: 'clip_not_reachable', message: 'Рендер не вернул https-ссылку на клип.' };
@@ -244,7 +287,9 @@ function createFilmPipeline({
 
   // ---- upscale ------------------------------------------------------------
 
-  async function upscaleStage(job, clips, signal) {
+  async function upscaleStage(job, clips, signal, mode) {
+    // Studio clips are already rendered at the final size.
+    if (mode === 'studio') return { clips, engine: 'native' };
     // Without ReCaVSR the assembler resizes with Lanczos — a resize, not
     // super-resolution — and the job says so.
     if (!upscaler) return { clips, engine: 'ffmpeg-lanczos' };
@@ -308,7 +353,7 @@ function createFilmPipeline({
 
   async function execute(job, input, signal) {
     const state = { lease: null };
-    const mode = renderMode();
+    const mode = (job.options && job.options.renderMode) || renderMode();
     try {
       const planned = await planStage(job, input);
       const plan = alignDurations(planned.plan, mode);
@@ -316,8 +361,8 @@ function createFilmPipeline({
       for (const scene of plan.scenes) {
         await db.createFilmShot({ id: crypto.randomUUID(), jobId: job.id, sceneNumber: scene.n, prompt: scene.prompt, durationSeconds: scene.durationSeconds });
       }
-      const rendered = await renderStage(job, plan, mode, input.photos || [], signal, state);
-      const upscaled = await upscaleStage(job, rendered, signal);
+      const rendered = await renderStage(job, plan, mode, input.photos || [], signal, state, { backdrop: input.backdrop, cutout: input.cutout });
+      const upscaled = await upscaleStage(job, rendered, signal, mode);
       const film = await assembleStage(job, plan, upscaled.clips);
       const current = await db.getFilmJob(job.id);
       const hours = state.lease ? (now() - Date.parse(state.lease.launchedAt)) / 3600000 : 0;
@@ -333,7 +378,7 @@ function createFilmPipeline({
         completedAt: new Date(now()).toISOString(),
         expiresAt: new Date(now() + config.filmRetentionDays * DAY_MS).toISOString(),
         error: null,
-        infra: { ...(current.infra || {}), upscaler: upscaled.engine, audio: film.audioMode, subtitleCues: film.subtitleCues, seconds: Math.round(film.seconds * 100) / 100 },
+        infra: { ...(current.infra || {}), ...(planned.fallback ? { plannerFallback: planned.fallback } : {}), upscaler: upscaled.engine, audio: film.audioMode, subtitleCues: film.subtitleCues, seconds: Math.round(film.seconds * 100) / 100 },
       });
     } catch (error) {
       const canceled = Boolean(signal && signal.aborted);
@@ -366,25 +411,28 @@ function createFilmPipeline({
   // input: { brief, presetPlan?, templateId?, scenes?, durationSeconds?, aspect?, audio?, voice?, photos? }
   async function start(user, input) {
     if (!config.filmEnabled) throw new FilmError('film_disabled', 'Конвейер фильмов выключен (FILM_ENABLED=false).', 503);
-    const mode = renderMode();
-    if (!mode) throw new FilmError('render_not_configured', 'Нет движка рендера: настройте RAY_DASHBOARD_URL, SkyPilot или SEEDANCE_API_KEY.', 503);
-    if (!input.presetPlan) {
-      if (!planner) throw new FilmError('planner_not_configured', 'SGLang не настроен: задайте SGLANG_BASE_URL и SGLANG_MODEL.', 503);
-      if (!input.brief || typeof input.brief.brief !== 'string' || input.brief.brief.trim().length < 8) {
-        throw new FilmError('brief_required', 'Опишите фильм одной фразой (минимум 8 символов).');
-      }
+    const photos = Array.isArray(input.photos) ? input.photos : [];
+    const mode = modeFor(photos, input.photoMode);
+    if (!mode) {
+      throw new FilmError('render_not_configured', 'Видеодвижок не подключён. Загрузите свои фото — ролик из них собирается встроенной студией; для генерации с нуля задайте SEEDANCE_API_KEY, RAY_DASHBOARD_URL или SkyPilot.', 503);
+    }
+    if (!input.presetPlan && (!input.brief || typeof input.brief.brief !== 'string' || input.brief.brief.trim().length < 8)) {
+      throw new FilmError('brief_required', 'Опишите фильм одной фразой (минимум 8 символов).');
     }
     const scenes = input.scenes === undefined ? 30 : Number(input.scenes);
     if (!Number.isInteger(scenes) || scenes < MIN_SCENES || scenes > MAX_SCENES) {
       throw new FilmError('invalid_scene_count', `Сцен должно быть от ${MIN_SCENES} до ${MAX_SCENES}.`);
     }
-    const photos = Array.isArray(input.photos) ? input.photos : [];
-    // Reference photos are sent inline; a cluster payload cannot carry them.
-    if (photos.length && mode !== 'local') {
-      throw new FilmError('photos_need_local_render', 'Ролик по своим фото пока работает только с локальным рендером (без Ray и SkyPilot).', 409);
+    // One account cannot occupy the whole machine: checked before anything is charged.
+    const mine = [...running.values()].filter((entry) => entry.userId === user.id).length;
+    if (mine >= config.filmMaxActivePerUser) {
+      throw new FilmError('too_many_active', `Одновременно можно собирать не больше ${config.filmMaxActivePerUser} роликов. Дождитесь завершения текущих.`, 429);
     }
     let billingSource = null;
-    if (billing) billingSource = await billing.consumeGeneration(user);
+    // A studio reel costs the operator nothing; FILM_STUDIO_FREE lets it run
+    // without spending the account's generations.
+    const charged = Boolean(billing) && !(mode === 'studio' && config.filmStudioFree);
+    if (charged) billingSource = await billing.consumeGeneration(user);
     let job;
     try {
       job = await db.createFilmJob({
@@ -398,19 +446,19 @@ function createFilmPipeline({
         baseResolution: config.filmBaseResolution,
         targetResolution: config.filmTargetResolution,
         audio: input.audio || input.voice ? { music: input.audio || null, voice: input.voice || null } : null,
-        options: { billingSource, photos: photos.length },
+        options: { billingSource, photos: photos.length, renderMode: mode },
       });
     } catch (error) {
-      if (billing) await billing.refundGeneration({ id: null, userId: user.id, billingSource });
+      if (charged) await billing.refundGeneration({ id: null, userId: user.id, billingSource });
       throw error;
     }
-    if (billing) await billing.recordGeneration(user.id, billingSource, job.id).catch(() => null);
+    if (charged) await billing.recordGeneration(user.id, billingSource, job.id).catch(() => null);
     const controller = new AbortController();
     const durationSeconds = Math.min(600, Math.max(30, Number(input.durationSeconds) || 150));
     const promise = execute(job, { ...input, photos, durationSeconds }, controller.signal)
       .catch((error) => logger.error(`film job ${job.id} crashed: ${error.code || error.message}`))
       .finally(() => running.delete(job.id));
-    running.set(job.id, { controller, promise });
+    running.set(job.id, { controller, promise, userId: user.id });
     return job;
   }
 
@@ -464,7 +512,7 @@ function createFilmPipeline({
     for (const entry of running.values()) entry.controller.abort();
   }
 
-  return { renderMode, publicJob, start, cancel, recover, cleanup, close, activeCount: () => running.size };
+  return { renderMode, modeFor, publicJob, start, cancel, recover, cleanup, close, activeCount: () => running.size };
 }
 
 module.exports = { createFilmPipeline, FilmError, ACTIVE_STATUSES };
