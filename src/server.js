@@ -37,6 +37,7 @@ const { createOwlBrowserExecutor } = require('./automation/owl-browser.js');
 const { createUnconfiguredExecutor } = require('./automation/unconfigured.js');
 const { createAutomationRunner } = require('./automation/runner.js');
 const { integrationReport } = require('./integrations.js');
+const { filmConfig, createFilmStack } = require('./film/index.js');
 
 const KNOWN_PROVIDERS = ['local-simulation', 'replicate'];
 const DEFAULT_PROVIDER = 'local-simulation';
@@ -231,6 +232,10 @@ function loadConfig(env = process.env, overrides = {}) {
     loginRateLimitMax: clamp(parseNumber(env.LOGIN_RATE_LIMIT_MAX, 5), 1, 100),
     loginRateLimitWindowMs: clamp(parseNumber(env.LOGIN_RATE_LIMIT_WINDOW_MS, 900000), 1000, 86400000),
     imageMaxBytes: clamp(parseNumber(env.IMAGE_MAX_BYTES, 262144), 16384, 5242880),
+    // Film pipeline (SGLang -> Ray -> SkyPilot -> ReCaVSR -> ffmpeg). Every
+    // stage stays off until its own variables are set; FILM_ENABLED alone is
+    // not enough to spend money on GPUs.
+    film: filmConfig(env),
     // Optional explicit public origin of this service (e.g. https://x.onrender.com).
     publicOrigin: env.PUBLIC_ORIGIN || '',
     replicate: {
@@ -497,6 +502,12 @@ function createProductionStack(config, { loginLimiter, globalLoginLimiter, helpe
     createOwlBrowserExecutor({ ...config.owlBrowser, fetchImpl }) ||
     createUnconfiguredExecutor(integrations.automation.missing);
   const automation = createAutomationRunner({ db, executor, logger, maxConcurrent: config.owlBrowser.maxConcurrent });
+
+  // Film pipeline. Built only when FILM_ENABLED is on; otherwise /api/film/*
+  // does not exist and no SGLang, Ray or SkyPilot call can be made.
+  const film = config.film.filmEnabled
+    ? createFilmStack({ ...config, ...config.film }, { db, storage, billing, seedance, logger, fetchImpl, runners: config.filmRunners })
+    : null;
   const api = createProductionApi({
     config,
     db,
@@ -512,8 +523,9 @@ function createProductionStack(config, { loginLimiter, globalLoginLimiter, helpe
     globalLoginLimiter,
     helpers,
     logger,
+    film,
   });
-  return { api, db, library, billing, seedance, storage, pipeline, tokens, automation };
+  return { api, db, library, billing, seedance, storage, pipeline, tokens, automation, film };
 }
 
 function createApp(options = {}) {
@@ -1149,6 +1161,7 @@ function createApp(options = {}) {
     for (const provider of providers.values()) provider.close();
     production.pipeline.close();
     production.automation.close();
+    if (production.film) production.film.pipeline.close();
   }
 
   return {
@@ -1170,6 +1183,7 @@ function createApp(options = {}) {
     pipeline: production.pipeline,
     tokens: production.tokens,
     automation: production.automation,
+    film: production.film,
   };
 }
 
@@ -1185,7 +1199,9 @@ function start(options = {}) {
   ready
     .then(() => {
       listen();
-      return Promise.all([app.pipeline.resume(), app.automation.resume()]);
+      // Film jobs are not resumed: interrupted ones are failed and refunded,
+      // and clusters they left behind are torn down.
+      return Promise.all([app.pipeline.resume(), app.automation.resume(), app.film ? app.film.pipeline.recover() : null]);
     })
     .catch((error) => {
       console.error(`database error: ${error.code || error.message}`);

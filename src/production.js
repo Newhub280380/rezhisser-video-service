@@ -20,6 +20,7 @@ const { CURRENCIES, TIERS, PERIOD_MS } = require('./billing/plans.js');
 const { LibraryError } = require('./library/index.js');
 const { AutomationError, publicRun } = require('./automation/runner.js');
 const { integrationReport } = require('./integrations.js');
+const { createFilmApi } = require('./film/api.js');
 
 const RESET_TTL_MS = 60 * 60 * 1000;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -69,6 +70,7 @@ function createProductionApi({
   helpers,
   logger = console,
   now = Date.now,
+  film = null,
 }) {
   const { sendJson, readJson, readBody, requestOrigin, clientIp, createPlan, validateImage, BriefError, RoutingError } = helpers;
 
@@ -94,6 +96,11 @@ function createProductionApi({
     if (!user) sendJson(res, 401, { error: 'auth_required', message: 'Войдите в аккаунт.' }, { 'Cache-Control': 'no-store' });
     return user;
   }
+
+  // The film router uses the same bearer check as the rest of the account API.
+  const filmApi = film
+    ? createFilmApi({ config: { ...config, ...config.film }, stack: film, db, helpers: { sendJson, readJson, requireUser }, logger })
+    : null;
 
   function loginRateLimited(req, res) {
     const perIp = loginLimiter.check(`account:${clientIp(req)}`);
@@ -553,6 +560,9 @@ function createProductionApi({
 
   async function route(req, res, pathname) {
     const { method } = req;
+
+    // Film pipeline (only when FILM_ENABLED=true).
+    if (filmApi && pathname.startsWith('/api/film/') && (await filmApi.handle(req, res, pathname))) return true;
 
     if (method === 'GET' && pathname === '/api/plans') {
       sendJson(res, 200, {

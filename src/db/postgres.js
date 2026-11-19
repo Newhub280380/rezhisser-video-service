@@ -50,9 +50,34 @@ const COLUMNS = {
     log: 'log', error: 'error', createdAt: 'created_at', updatedAt: 'updated_at', startedAt: 'started_at',
     completedAt: 'completed_at',
   },
+  film_jobs: {
+    id: 'id', userId: 'user_id', status: 'status', stage: 'stage', templateId: 'template_id',
+    sceneCount: 'scene_count', aspect: 'aspect', baseResolution: 'base_resolution',
+    targetResolution: 'target_resolution', engine: 'engine', plan: 'plan',
+    planHash: 'plan_hash', audio: 'audio', options: 'options', infra: 'infra', costUsd: 'cost_usd',
+    progress: 'progress', outputKey: 'output_key', outputUrl: 'output_url', outputBytes: 'output_bytes',
+    error: 'error', createdAt: 'created_at', updatedAt: 'updated_at', completedAt: 'completed_at',
+    expiresAt: 'expires_at',
+  },
+  film_shots: {
+    id: 'id', jobId: 'job_id', sceneNumber: 'scene_number', status: 'status', prompt: 'prompt',
+    params: 'params', attempts: 'attempts', providerTaskId: 'provider_task_id', clipKey: 'clip_key',
+    clipUrl: 'clip_url', localPath: 'local_path', upscaledKey: 'upscaled_key',
+    durationSeconds: 'duration_seconds',
+    costUsd: 'cost_usd', error: 'error', createdAt: 'created_at', updatedAt: 'updated_at',
+    completedAt: 'completed_at',
+  },
+  infra_leases: {
+    id: 'id', jobId: 'job_id', provider: 'provider', clusterName: 'cluster_name', region: 'region',
+    accelerator: 'accelerator', nodes: 'nodes', hourlyUsd: 'hourly_usd', status: 'status',
+    detail: 'detail', launchedAt: 'launched_at', teardownAt: 'teardown_at', createdAt: 'created_at',
+    updatedAt: 'updated_at',
+  },
 };
-const JSON_COLUMNS = new Set(['brief', 'error', 'log']);
-const NUMERIC_FIELDS = new Set(['costUsd', 'videoBytes', 'amountMinor']);
+const JSON_COLUMNS = new Set(['brief', 'error', 'log', 'plan', 'audio', 'options', 'infra', 'params', 'detail']);
+const NUMERIC_FIELDS = new Set([
+  'costUsd', 'videoBytes', 'amountMinor', 'outputBytes', 'hourlyUsd', 'durationSeconds',
+]);
 
 function toRow(table, row) {
   if (!row) return null;
@@ -355,6 +380,50 @@ function createPostgresDatabase({ connectionString, ssl, pool: injectedPool, lib
       );
       return result.rowCount;
     },
+
+    // ---- film pipeline ------------------------------------------------------
+
+    createFilmJob(job) {
+      const sql = insertSql('film_jobs', { progress: 0, costUsd: 0, ...job });
+      return one('film_jobs', sql.text, sql.values);
+    },
+    updateFilmJob(id, patch) {
+      const sql = updateSql('film_jobs', id, patch);
+      return one('film_jobs', sql.text, sql.values);
+    },
+    getFilmJob: (id) => one('film_jobs', 'SELECT * FROM film_jobs WHERE id = $1', [id]),
+    listFilmJobs: (userId, { limit = 50 } = {}) =>
+      many('film_jobs', 'SELECT * FROM film_jobs WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2', [userId, limit]),
+    // Statuses that mean "a cluster may still be rented for this job".
+    listFilmJobsByStatus: (statuses = []) =>
+      many('film_jobs', 'SELECT * FROM film_jobs WHERE status = ANY($1)', [statuses]),
+
+    createFilmShot(shot) {
+      const sql = insertSql('film_shots', { attempts: 0, costUsd: 0, status: 'pending', ...shot });
+      return one('film_shots', sql.text, sql.values);
+    },
+    updateFilmShot(id, patch) {
+      const sql = updateSql('film_shots', id, patch);
+      return one('film_shots', sql.text, sql.values);
+    },
+    getFilmShot: (id) => one('film_shots', 'SELECT * FROM film_shots WHERE id = $1', [id]),
+    listFilmShots: (jobId) =>
+      many('film_shots', 'SELECT * FROM film_shots WHERE job_id = $1 ORDER BY scene_number', [jobId]),
+
+    createInfraLease(lease) {
+      const sql = insertSql('infra_leases', { nodes: 1, hourlyUsd: 0, status: 'provisioning', ...lease });
+      return one('infra_leases', sql.text, sql.values);
+    },
+    updateInfraLease(id, patch) {
+      const sql = updateSql('infra_leases', id, patch);
+      return one('infra_leases', sql.text, sql.values);
+    },
+    getInfraLease: (id) => one('infra_leases', 'SELECT * FROM infra_leases WHERE id = $1', [id]),
+    listInfraLeases(jobId) {
+      return many('infra_leases', 'SELECT * FROM infra_leases WHERE job_id = $1 ORDER BY created_at DESC', [jobId]);
+    },
+    listOpenInfraLeases: () =>
+      many('infra_leases', "SELECT * FROM infra_leases WHERE status IN ('provisioning', 'running', 'tearing_down')", []),
   };
 }
 

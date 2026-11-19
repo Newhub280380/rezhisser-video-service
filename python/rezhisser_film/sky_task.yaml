@@ -1,0 +1,32 @@
+# SkyPilot task for one film render.
+#
+# Started by src/film/skypilot.js, which adds the cluster name, the GPU type,
+# the cloud, spot/on-demand, `--down -y`, `--workdir <job folder>` and
+# `--env FILM_RENDER_ENDPOINT=...` on the command line.
+#
+# The job folder synced as the workdir contains film_job.py and
+# film_payload.json. `sky launch` streams this task's output, which is how the
+# orchestrator receives the FILM_PROGRESS / FILM_RESULT lines.
+#
+# `--down` destroys the cluster when this task ends. Per the SkyPilot docs it
+# does NOT do so when provisioning or setup fails, which is why the
+# orchestrator also runs `sky down` itself and keeps a lease record.
+
+name: rezhisser-film
+
+resources:
+  disk_size: 100
+
+envs:
+  FILM_RENDER_ENDPOINT: ""
+  FILM_RENDER_TIMEOUT_S: "900"
+  FILM_GPUS_PER_SCENE: "0"
+
+setup: |
+  set -euo pipefail
+  python3 -m pip install --quiet "ray[default]"
+
+run: |
+  set -uo pipefail
+  # A non-zero exit means some scenes failed; the FILM_RESULT line says which.
+  python3 film_job.py --payload-file film_payload.json

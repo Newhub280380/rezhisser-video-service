@@ -2,13 +2,15 @@
 
 // Retention job: deletes generated videos older than VIDEO_RETENTION_DAYS
 // (default 30) from object storage and marks the jobs as expired; also prunes
-// used/expired password-reset tokens. Run as a Railway cron service:
+// used/expired password-reset tokens. With FILM_ENABLED=true it also removes
+// the files of films older than FILM_RETENTION_DAYS. Run as a Railway cron service:
 //   node src/cron/cleanup.js
 
 const path = require('node:path');
 const { createDatabase } = require('../db/index.js');
 const { createS3Storage } = require('../storage/s3.js');
 const { loadConfig } = require('../server.js');
+const { createFilmStack } = require('../film/index.js');
 
 async function runCleanup({ db, storage, now = Date.now(), batchSize = 100, logger = console }) {
   let expired = 0;
@@ -42,6 +44,10 @@ async function main() {
     const result = await runCleanup({ db, storage });
     console.log(`cleanup: expired ${result.expired} videos, ${result.failed} failures, ${result.resets} reset tokens removed`);
     if (result.failed > 0) process.exitCode = 1;
+    if (config.film.filmEnabled) {
+      const film = createFilmStack({ ...config, ...config.film }, { db, storage });
+      console.log(`cleanup: removed the files of ${await film.pipeline.cleanup()} expired films`);
+    }
   } finally {
     await db.close();
   }

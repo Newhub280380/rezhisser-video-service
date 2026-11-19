@@ -418,6 +418,93 @@ Every job says explicitly what it is: `provider`, `simulated`,
 `result: { simulated: true, videoUrl: null }`. The UI shows a player and a
 download link **only** for a real `https` video URL.
 
+## Film pipeline (`/film`)
+
+Template reels and long films, assembled into one MP4. Off by default
+(`FILM_ENABLED=true` turns it on; while it is off, `/api/film/*` does not exist).
+
+```
+plan  ->  render every scene in parallel  ->  upscale  ->  assemble MP4
+```
+
+| Stage | What runs | Needs |
+| --- | --- | --- |
+| Plan, template reel | A fixed storyboard from `src/film/templates.js`; no model is called. | — |
+| Plan, long film (24–36 scenes) | An SGLang server, asked for `shot_plan.json` with a JSON schema; the answer is validated again here, repaired once, otherwise the job fails. | `SGLANG_BASE_URL`, `SGLANG_MODEL` |
+| Render | In order of preference: an existing Ray cluster, a cluster rented with SkyPilot, or this machine (scenes in parallel through Seedance). | `RAY_DASHBOARD_URL`, or `SKYPILOT_*`, or `SEEDANCE_*` |
+| Upscale | A command you configure, run once per clip. Without it clips are resized with ffmpeg (Lanczos) and the job says so. | `RECAVSR_COMMAND` |
+| Assemble | ffmpeg: scene order, exact frame size and 24 fps, burned-in subtitles, music and voiceover. | `ffmpeg`, `ffprobe` |
+
+### What is and is not included
+
+- **Tested with real tools:** the ffmpeg assembly and the photo normalisation
+  (the tests run ffmpeg when it is installed).
+- **Tested against fakes only:** SGLang, Ray, SkyPilot, the upscaler command,
+  yt-dlp and the inpainting service. Their requests follow the public
+  documentation, but none of them has been run against a live server from this
+  repository. Try each one on a small job before relying on it.
+- **Not included:** a video model for clusters. On Ray or SkyPilot the driver
+  (`python/rezhisser_film/film_job.py`) sends every scene to a render service
+  you operate (`FILM_RENDER_ENDPOINT`, contract in the file header). ReCaVSR,
+  background removal, photo enhancement and inpainting models are not included
+  either; each is an adapter to a command or service you provide.
+- **Film from your own photos** works with local rendering only: prepared
+  photos become the first frames of the scenes, in order.
+
+### Templates
+
+Six presets (`GET /api/film/templates`). The buyer fills in niche, subject,
+location and style; the shots, their length, the camera move (Pan Left), 24 fps,
+9:16 and the look are fixed, and any other parameter sent by a client is
+ignored and listed in `ignoredFields`. The request is therefore identical on
+every run. The video model is still generative: runs are consistent in framing
+and pacing, not pixel-identical.
+
+### Renting GPUs with SkyPilot
+
+Requires the `sky` CLI and cloud credentials on the machine running this
+service. `SKYPILOT_DRY_RUN=true` (the default) never starts a cluster.
+
+- The cheapest offer is taken from the CLI price listing, limited to
+  `FILM_ACCELERATORS`, `SKYPILOT_CLOUDS` and `SKYPILOT_MAX_HOURLY_USD`. If
+  prices cannot be read, or no offer fits, nothing is launched. Without a price
+  ceiling nothing is launched either.
+- The cluster is destroyed three ways: `sky launch --down`, an explicit
+  `sky down` when the job ends (success, failure or cancel), and a lease record
+  that is torn down at the next service start if the process died.
+- If teardown fails, the job is marked `needs_attention` and its error contains
+  the exact `sky down <cluster>` command to run by hand.
+- `costEstimateUsd` is rented time × listed hourly price — an estimate, not
+  the provider's invoice.
+
+### Billing and recovery
+
+One film reserves one generation from the account. A failed or cancelled film
+returns it. Films interrupted by a restart are marked failed and refunded; they
+are not resumed. Finished films are removed after `FILM_RETENTION_DAYS` by
+`src/cron/cleanup.js`.
+
+### API
+
+| Method | Path | Description |
+| --- | --- | --- |
+| `GET` | `/film` | The page: templates, own photos, long film, music, object replacement, jobs. |
+| `GET` | `/api/film/capabilities` | Which stage is configured and which variables are missing (names only). |
+| `GET` | `/api/film/templates` | The presets and their locked parameters. |
+| `POST` | `/api/film/presets` | `{ templateId, metadata }` → the fixed shot plan. Free; no provider is called. |
+| `POST` | `/api/film/jobs` | Account. `{ templateId, metadata }` or `{ brief, scenes, durationSeconds, aspect }`, plus optional `audio`, `voice` (`{ trackId }` or `{ downloadId }`) and `photoIds`. |
+| `GET` | `/api/film/jobs` | Account. The caller's last 50 films. |
+| `GET` | `/api/film/jobs/:id` | Account. Job, plan and per-scene status. |
+| `GET` | `/api/film/jobs/:id/video` | Account. The MP4 (redirect to a signed link, or the file itself). |
+| `POST` | `/api/film/jobs/:id/cancel` | Account. Stops the job, destroys its cluster, refunds it. |
+| `POST` | `/api/film/photos/prepare` | Account. Up to 6 photos per request → ids and a per-step report. |
+| `GET` | `/api/film/audio/library` | Account. Tracks from `FILM_MUSIC_DIR`. |
+| `POST` | `/api/film/audio/link` | Account. Extracts the audio of a video page (allowed hosts only) → `downloadId`. |
+| `POST` | `/api/film/inpaint` | Account. `{ image, mask, prompt, mode, reference? }` → edited image URL. |
+
+Use only music you have the rights to; extracting audio from a video page does
+not grant any.
+
 ## Using it from business-41.pazi.dev
 
 The new app is served **by this Render service** (same origin). **The Pazi

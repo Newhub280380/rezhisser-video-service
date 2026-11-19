@@ -91,7 +91,7 @@ function createSeedanceProvider({
       };
     },
     activeCount: () => active,
-    buildRequest({ prompt, image, aspect, duration }) {
+    buildRequest({ prompt, image, aspect, duration, resolution: requestResolution }) {
       const content = [{ type: 'text', text: prompt }];
       if (image) content.push({ type: 'image_url', image_url: { url: image }, role: imageRole });
       return {
@@ -100,7 +100,7 @@ function createSeedanceProvider({
         content,
         ratio: aspect || 'adaptive',
         duration,
-        resolution,
+        resolution: requestResolution || resolution,
         generate_audio: generateAudio,
       };
     },
