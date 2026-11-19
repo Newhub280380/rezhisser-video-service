@@ -1,0 +1,163 @@
+/* Режиссёр Фильм — page styles. Uses the tokens from studio.css. */
+
+.film-section {
+  max-width: 980px;
+  margin: 0 auto 28px;
+  padding: 22px;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+
+.film-section h2 { margin: 0 0 8px; font-size: 20px; }
+.film-section h3 { margin: 0 0 8px; font-size: 16px; }
+
+.film-hint { margin: 0 0 14px; color: var(--ink-2); font-size: 13px; }
+.film-hint code { font-family: var(--mono); font-size: 12px; }
+
+.template-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 12px;
+}
+
+.template-card {
+  text-align: left;
+  padding: 14px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  color: var(--ink);
+  font: inherit;
+  cursor: pointer;
+}
+
+.template-card:hover { border-color: var(--neon); }
+.template-card[aria-pressed="true"] {
+  border-color: var(--neon);
+  box-shadow: 0 0 0 1px var(--neon) inset;
+}
+
+.template-card strong { display: block; margin-bottom: 6px; font-size: 15px; }
+.template-card span { color: var(--ink-2); font-size: 13px; }
+
+.film-form {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 12px;
+  align-items: end;
+}
+
+.field { display: flex; flex-direction: column; gap: 6px; }
+.field-wide { grid-column: 1 / -1; }
+.field label { font-size: 13px; color: var(--ink-2); }
+
+.field input,
+.field select,
+.field textarea {
+  font: inherit;
+  color: var(--ink);
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px 12px;
+}
+
+.field input:focus-visible,
+.field select:focus-visible,
+.field textarea:focus-visible {
+  outline: 2px solid var(--neon);
+  outline-offset: 1px;
+}
+
+.film-actions {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 4px;
+}
+
+.locked-box {
+  margin-top: 16px;
+  padding: 14px;
+  background: rgba(124, 92, 255, 0.08);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+}
+
+.locked-list {
+  display: grid;
+  grid-template-columns: minmax(120px, 220px) 1fr;
+  gap: 6px 14px;
+  margin: 0;
+  font-size: 13px;
+}
+
+.locked-list dt { color: var(--ink-3); font-family: var(--mono); font-size: 12px; }
+.locked-list dd { margin: 0; color: var(--ink); }
+
+.job-list { list-style: none; margin: 14px 0 0; padding: 0; display: grid; gap: 10px; }
+
+.job-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 8px 14px;
+  align-items: center;
+  padding: 12px 14px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+}
+
+.job-title { font-size: 14px; }
+.job-sub { color: var(--ink-3); font-size: 12px; font-family: var(--mono); }
+
+.job-status { font-size: 12px; padding: 3px 8px; border-radius: 999px; border: 1px solid var(--line); }
+.job-status[data-state="succeeded"] { color: var(--ok); border-color: rgba(51, 209, 122, 0.4); }
+.job-status[data-state="failed"] { color: var(--danger); border-color: rgba(255, 90, 90, 0.4); }
+.job-status[data-state="needs_attention"] { color: var(--gold); border-color: rgba(255, 195, 90, 0.45); }
+.job-status[data-state="running"] { color: var(--neon-2); border-color: rgba(25, 227, 212, 0.4); }
+
+.job-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+
+.job-progress { grid-column: 1 / -1; width: 100%; height: 6px; accent-color: var(--neon); }
+
+.template-meta { display: block; margin-top: 8px; color: var(--ink-3); font-family: var(--mono); font-size: 12px; }
+
+.report-list { margin: 12px 0 0; padding-left: 20px; color: var(--ink-2); font-size: 13px; }
+
+.result-image {
+  display: block;
+  max-width: 100%;
+  max-height: 420px;
+  margin-top: 12px;
+  border-radius: 12px;
+}
+
+.mask-canvas { display: block; max-width: 100%; height: auto; margin: 14px 0; border: 1px solid var(--line); border-radius: 12px; cursor: crosshair; touch-action: none; }
+
+.film-section h1 { margin: 0 0 8px; font-size: 26px; }
+
+.shot-list { margin: 0; padding-left: 22px; display: grid; gap: 6px; font-size: 13px; }
+.shot-list li { color: var(--ink-2); }
+.shot-list li[data-state="ready"] { color: var(--ok); }
+.shot-list li[data-state="failed"] { color: var(--danger); }
+
+.caps-list {
+  display: grid;
+  grid-template-columns: minmax(120px, 200px) 1fr;
+  gap: 6px 14px;
+  margin: 0;
+  font-size: 13px;
+}
+
+.caps-list dt { color: var(--ink-3); font-family: var(--mono); font-size: 12px; }
+.caps-list dd { margin: 0; }
+
+.error-text { color: var(--danger); font-size: 13px; }
+
+@media (max-width: 640px) {
+  .film-section { padding: 16px; }
+  .locked-list, .caps-list { grid-template-columns: 1fr; }
+}

@@ -9,12 +9,15 @@ const ROUTES = {
   '/app': { file: 'index.html', type: 'text/html; charset=utf-8' },
   '/studio': { file: 'studio.html', type: 'text/html; charset=utf-8' },
   '/automation': { file: 'automation.html', type: 'text/html; charset=utf-8' },
+  '/film': { file: 'film.html', type: 'text/html; charset=utf-8' },
   '/assets/app.css': { file: 'app.css', type: 'text/css; charset=utf-8' },
   '/assets/app.js': { file: 'app.js', type: 'text/javascript; charset=utf-8' },
   '/assets/studio.css': { file: 'studio.css', type: 'text/css; charset=utf-8' },
   '/assets/studio.js': { file: 'studio.js', type: 'text/javascript; charset=utf-8' },
   '/assets/automation.css': { file: 'automation.css', type: 'text/css; charset=utf-8' },
   '/assets/automation.js': { file: 'automation.js', type: 'text/javascript; charset=utf-8' },
+  '/assets/film.css': { file: 'film.css', type: 'text/css; charset=utf-8' },
+  '/assets/film.js': { file: 'film.js', type: 'text/javascript; charset=utf-8' },
   '/assets/favicon.svg': { file: 'favicon.svg', type: 'image/svg+xml' },
 };
 const CONTENT_SECURITY_POLICY = [

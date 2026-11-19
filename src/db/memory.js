@@ -9,7 +9,10 @@
 const fs = require('node:fs');
 const path = require('node:path');
 
-const TABLES = ['users', 'passwordResets', 'videoJobs', 'payments', 'usageEvents', 'projects', 'automationTasks', 'automationRuns'];
+const TABLES = [
+  'users', 'passwordResets', 'videoJobs', 'payments', 'usageEvents', 'projects',
+  'automationTasks', 'automationRuns', 'filmJobs', 'filmShots', 'infraLeases',
+];
 
 const ACTIVE_RUN_STATUSES = new Set(['queued', 'running']);
 
@@ -440,6 +443,150 @@ function createMemoryDatabase({ file = null } = {}) {
         }
         return count;
       });
+    },
+
+    // ---- film pipeline ------------------------------------------------------
+
+    async createFilmJob(job) {
+      return mutate(() => {
+        const now = nowIso();
+        const row = {
+          status: 'queued',
+          stage: null,
+          templateId: null,
+          sceneCount: null,
+          aspect: '16:9',
+          baseResolution: '480p',
+          targetResolution: '2160p',
+          engine: null,
+          plan: null,
+          planHash: null,
+          audio: null,
+          options: null,
+          infra: null,
+          costUsd: 0,
+          progress: 0,
+          outputKey: null,
+          outputUrl: null,
+          outputBytes: null,
+          error: null,
+          completedAt: null,
+          expiresAt: null,
+          createdAt: now,
+          updatedAt: now,
+          ...job,
+        };
+        state.filmJobs.set(row.id, row);
+        return row;
+      });
+    },
+    async updateFilmJob(id, patch) {
+      return mutate(() => {
+        const job = state.filmJobs.get(id);
+        if (!job) return null;
+        Object.assign(job, patch, { updatedAt: nowIso() });
+        for (const key of ['completedAt', 'expiresAt']) if (key in patch) job[key] = iso(patch[key]);
+        return job;
+      });
+    },
+    async getFilmJob(id) {
+      return clone(state.filmJobs.get(id));
+    },
+    async listFilmJobs(userId, { limit = 50 } = {}) {
+      return clone(
+        Array.from(state.filmJobs.values()).filter((job) => job.userId === userId).sort(byNewest).slice(0, limit),
+      );
+    },
+    async listFilmJobsByStatus(statuses = []) {
+      const set = new Set(statuses);
+      return clone(Array.from(state.filmJobs.values()).filter((job) => set.has(job.status)));
+    },
+
+    async createFilmShot(shot) {
+      return mutate(() => {
+        const now = nowIso();
+        const row = {
+          status: 'pending',
+          prompt: null,
+          params: null,
+          attempts: 0,
+          providerTaskId: null,
+          clipKey: null,
+          clipUrl: null,
+          localPath: null,
+          upscaledKey: null,
+          durationSeconds: null,
+          costUsd: 0,
+          error: null,
+          completedAt: null,
+          createdAt: now,
+          updatedAt: now,
+          ...shot,
+        };
+        state.filmShots.set(row.id, row);
+        return row;
+      });
+    },
+    async updateFilmShot(id, patch) {
+      return mutate(() => {
+        const shot = state.filmShots.get(id);
+        if (!shot) return null;
+        Object.assign(shot, patch, { updatedAt: nowIso() });
+        if ('completedAt' in patch) shot.completedAt = iso(patch.completedAt);
+        return shot;
+      });
+    },
+    async getFilmShot(id) {
+      return clone(state.filmShots.get(id));
+    },
+    async listFilmShots(jobId) {
+      return clone(
+        Array.from(state.filmShots.values())
+          .filter((shot) => shot.jobId === jobId)
+          .sort((a, b) => a.sceneNumber - b.sceneNumber),
+      );
+    },
+
+    async createInfraLease(lease) {
+      return mutate(() => {
+        const now = nowIso();
+        const row = {
+          status: 'provisioning',
+          nodes: 1,
+          hourlyUsd: 0,
+          region: null,
+          accelerator: null,
+          detail: null,
+          launchedAt: null,
+          teardownAt: null,
+          createdAt: now,
+          updatedAt: now,
+          ...lease,
+        };
+        state.infraLeases.set(row.id, row);
+        return row;
+      });
+    },
+    async updateInfraLease(id, patch) {
+      return mutate(() => {
+        const lease = state.infraLeases.get(id);
+        if (!lease) return null;
+        Object.assign(lease, patch, { updatedAt: nowIso() });
+        for (const key of ['launchedAt', 'teardownAt']) if (key in patch) lease[key] = iso(patch[key]);
+        return lease;
+      });
+    },
+    async getInfraLease(id) {
+      return clone(state.infraLeases.get(id));
+    },
+    async listInfraLeases(jobId) {
+      return clone(
+        Array.from(state.infraLeases.values()).filter((lease) => lease.jobId === jobId).sort(byNewest),
+      );
+    },
+    async listOpenInfraLeases() {
+      const open = new Set(['provisioning', 'running', 'tearing_down']);
+      return clone(Array.from(state.infraLeases.values()).filter((lease) => open.has(lease.status)));
     },
   };
 }

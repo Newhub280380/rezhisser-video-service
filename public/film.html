@@ -1,0 +1,245 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="description" content="Режиссёр Фильм: Reels по шаблону, ролик по своим фото, замена объекта по маске, музыка и длинный фильм из 24–36 сцен.">
+  <title>Режиссёр Фильм</title>
+  <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/assets/studio.css">
+  <link rel="stylesheet" href="/assets/film.css">
+  <script src="/assets/film.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#film-main">Перейти к содержимому</a>
+
+  <header class="bar">
+    <a class="logo" href="/studio" aria-label="Режиссёр">
+      <span class="logo-mark" aria-hidden="true"></span>
+      <span>Режиссёр Фильм</span>
+    </a>
+    <nav class="nav" aria-label="Разделы">
+      <a href="/studio">Studio</a>
+      <a href="/film" aria-current="page">Фильм</a>
+      <a href="/app">Режиссёр</a>
+    </nav>
+    <div class="bar-actions">
+      <a class="btn btn-ghost" href="/studio#/login" id="film-login">Войти</a>
+    </div>
+  </header>
+
+  <div class="toast" id="film-toast" role="status" aria-live="polite" hidden></div>
+
+  <main id="film-main" tabindex="-1">
+    <section class="film-section" id="film-off" hidden>
+      <h1>Конвейер фильмов выключен</h1>
+      <p class="film-hint">На этом сервере не задано FILM_ENABLED=true, поэтому раздел недоступен.</p>
+    </section>
+
+    <div id="film-on" hidden>
+      <section class="film-section" aria-labelledby="templates-title">
+        <h1 id="templates-title">Reels по шаблону</h1>
+        <p class="film-hint" id="templates-note">Выберите шаблон и заполните четыре поля. Раскадровка, движение камеры (Pan Left), 24 кадра/с, формат 9:16 и стиль Cinematic 4K заданы шаблоном и из интерфейса не меняются.</p>
+        <div class="template-grid" id="template-grid" role="group" aria-label="Шаблоны"></div>
+        <form class="film-form" id="preset-form" novalidate>
+          <div class="field">
+            <label for="meta-niche">Ниша</label>
+            <input id="meta-niche" type="text" maxlength="120" autocomplete="off" placeholder="кофейня" required>
+          </div>
+          <div class="field">
+            <label for="meta-subject">Объект</label>
+            <input id="meta-subject" type="text" maxlength="120" autocomplete="off" placeholder="капучино в керамической чашке" required>
+          </div>
+          <div class="field">
+            <label for="meta-location">Локация</label>
+            <input id="meta-location" type="text" maxlength="120" autocomplete="off" placeholder="стойка у окна, утро" required>
+          </div>
+          <div class="field">
+            <label for="meta-style">Стиль</label>
+            <input id="meta-style" type="text" maxlength="120" autocomplete="off" placeholder="тёплый, минимализм" required>
+          </div>
+          <div class="film-actions">
+            <button class="btn btn-ghost" type="button" id="preview-btn">Показать раскадровку</button>
+            <button class="btn btn-primary" type="submit" id="preset-submit">Создать ролик</button>
+          </div>
+        </form>
+        <div class="locked-box" id="preview-box" hidden>
+          <h2>Что будет снято</h2>
+          <p class="film-hint" id="preview-meta"></p>
+          <ol class="shot-list" id="preview-shots"></ol>
+        </div>
+      </section>
+
+      <section class="film-section" aria-labelledby="photos-title">
+        <h2 id="photos-title">Свои фото</h2>
+        <p class="film-hint" id="photos-note">Загрузите фото как есть. Каждое очищается, предмет отделяется от фона. Дальше — одна кнопка: ролик собирается прямо на сервере, предмет на видео остаётся точно таким, как на фото.</p>
+        <div class="film-form">
+          <div class="field field-wide">
+            <label for="photo-files">Фото (PNG, JPEG, WebP, до 8 МБ каждое)</label>
+            <input id="photo-files" type="file" accept="image/png,image/jpeg,image/webp" multiple>
+          </div>
+          <div class="film-actions">
+            <button class="btn btn-ghost" type="button" id="photo-upload">Подготовить фото</button>
+            <button class="btn btn-ghost" type="button" id="photo-clear">Не использовать фото</button>
+          </div>
+        </div>
+        <ul class="report-list" id="photo-list"></ul>
+        <div class="film-form" id="reel-form" hidden>
+          <div class="field">
+            <label for="reel-look">Подача</label>
+            <select id="reel-look">
+              <option value="cutout">Предмет на студийном фоне</option>
+              <option value="photo">Фото целиком</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="reel-backdrop">Фон студии</label>
+            <select id="reel-backdrop"></select>
+          </div>
+          <div class="field">
+            <label for="reel-aspect">Формат</label>
+            <select id="reel-aspect">
+              <option value="9:16">9:16 — Reels, Shorts</option>
+              <option value="1:1">1:1 — лента</option>
+              <option value="4:5">4:5 — лента</option>
+              <option value="16:9">16:9 — YouTube</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="reel-seconds">Секунд на фото</label>
+            <input id="reel-seconds" type="number" min="2" max="10" step="1" value="4">
+          </div>
+          <div class="field field-wide">
+            <label for="reel-captions">Подписи на экране (по одной на строку, необязательно)</label>
+            <textarea id="reel-captions" rows="3" maxlength="2000" placeholder="Новая коллекция&#10;Ручная работа&#10;Доставка за 2 дня"></textarea>
+          </div>
+          <div class="film-actions">
+            <button class="btn btn-primary" type="button" id="reel-submit">Собрать ролик из фото</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="film-section" aria-labelledby="film-title">
+        <h2 id="film-title">Длинный фильм (24–36 сцен)</h2>
+        <p class="film-hint" id="film-note">Раскадровку пишет языковая модель (SGLang), а если она не подключена — встроенный раскадровщик. Сцены рендерятся параллельно и собираются в один MP4.</p>
+        <form class="film-form" id="film-form" novalidate>
+          <div class="field field-wide">
+            <label for="film-brief">О чём фильм</label>
+            <textarea id="film-brief" rows="3" maxlength="900" placeholder="Один день небольшой кофейни: открытие, первые гости, работа бариста, вечер" required></textarea>
+          </div>
+          <div class="field">
+            <label for="film-scenes">Сцен</label>
+            <input id="film-scenes" type="number" min="24" max="36" step="1" value="30">
+          </div>
+          <div class="field">
+            <label for="film-duration">Длительность, сек</label>
+            <input id="film-duration" type="number" min="60" max="360" step="5" value="150">
+          </div>
+          <div class="field">
+            <label for="film-aspect">Формат</label>
+            <select id="film-aspect">
+              <option value="16:9">16:9</option>
+              <option value="9:16">9:16</option>
+              <option value="1:1">1:1</option>
+              <option value="2.39:1">2.39:1</option>
+            </select>
+          </div>
+          <div class="film-actions">
+            <button class="btn btn-primary" type="submit" id="film-submit">Запустить фильм</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="film-section" aria-labelledby="audio-title">
+        <h2 id="audio-title">Музыка</h2>
+        <p class="film-hint" id="audio-note">Трек обрезается или зацикливается под длину ролика, с плавным началом и концом. Озвучка накладывается поверх, музыка под ней приглушается. Используйте музыку, на которую у вас есть права.</p>
+        <div class="film-form">
+          <div class="field">
+            <label for="audio-library">Трек из библиотеки</label>
+            <select id="audio-library">
+              <option value="">Без музыки</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="voice-library">Озвучка из библиотеки</label>
+            <select id="voice-library">
+              <option value="">Без озвучки</option>
+            </select>
+          </div>
+          <div class="field field-wide">
+            <label for="audio-url">Или ссылка на видео (YouTube)</label>
+            <input id="audio-url" type="url" maxlength="2048" autocomplete="off" placeholder="https://www.youtube.com/watch?v=...">
+          </div>
+          <div class="film-actions">
+            <button class="btn btn-ghost" type="button" id="audio-fetch">Извлечь аудио по ссылке</button>
+          </div>
+        </div>
+        <p class="film-hint" id="audio-chosen">Музыка не выбрана.</p>
+      </section>
+
+      <section class="film-section" aria-labelledby="inpaint-title">
+        <h2 id="inpaint-title">Предметная съёмка по маске</h2>
+        <p class="film-hint" id="inpaint-note">Загрузите фото и при необходимости выделите область мышью. Сам товар не перерисовывается: меняется только то, что вокруг него или в выделенной области.</p>
+        <div class="film-form">
+          <div class="field">
+            <label for="inpaint-source">Исходное фото</label>
+            <input id="inpaint-source" type="file" accept="image/png,image/jpeg,image/webp">
+          </div>
+          <div class="field">
+            <label for="inpaint-product">Фото товара (для вставки)</label>
+            <input id="inpaint-product" type="file" accept="image/png,image/jpeg,image/webp">
+          </div>
+          <div class="field">
+            <label for="inpaint-background">Свой фон (необязательно)</label>
+            <input id="inpaint-background" type="file" accept="image/png,image/jpeg,image/webp">
+          </div>
+          <div class="field">
+            <label for="inpaint-backdrop">Фон студии</label>
+            <select id="inpaint-backdrop"></select>
+          </div>
+          <div class="field">
+            <label for="inpaint-mode">Действие</label>
+            <select id="inpaint-mode">
+              <option value="background">Заменить фон, товар оставить</option>
+              <option value="insert">Вставить товар в выделенную область</option>
+              <option value="erase">Убрать мелкую деталь в области</option>
+              <option value="replace" data-generative="true">Нарисовать новое в области (нейросеть)</option>
+              <option value="remove" data-generative="true">Убрать объект (нейросеть)</option>
+            </select>
+          </div>
+          <div class="field field-wide">
+            <label for="inpaint-prompt">Что нарисовать (только для режимов с нейросетью)</label>
+            <input id="inpaint-prompt" type="text" maxlength="800" autocomplete="off" placeholder="стеклянная банка крема с белой крышкой">
+          </div>
+        </div>
+        <canvas class="mask-canvas" id="inpaint-canvas" width="640" height="360" aria-label="Область замены: выделите прямоугольник мышью" hidden></canvas>
+        <div class="film-actions">
+          <button class="btn btn-primary" type="button" id="inpaint-run">Выполнить</button>
+        </div>
+        <div id="inpaint-result" hidden>
+          <img class="result-image" id="inpaint-image" alt="Результат обработки">
+          <p class="film-hint" id="inpaint-status"></p>
+          <p class="film-hint"><a id="inpaint-link" href="/film" rel="noopener noreferrer" target="_blank" download="product.jpg">Скачать результат</a></p>
+        </div>
+      </section>
+
+      <section class="film-section" aria-labelledby="jobs-title">
+        <h2 id="jobs-title">Мои ролики</h2>
+        <button class="btn btn-ghost" type="button" id="refresh-btn">Обновить</button>
+        <ul class="job-list" id="job-list" aria-live="polite"></ul>
+        <div class="locked-box" id="job-detail" hidden>
+          <h3 id="job-detail-title">Раскадровка</h3>
+          <p class="film-hint" id="job-detail-meta"></p>
+          <ol class="shot-list" id="shot-list"></ol>
+        </div>
+      </section>
+
+      <section class="film-section" aria-labelledby="caps-title">
+        <h2 id="caps-title">Что настроено на сервере</h2>
+        <dl class="caps-list" id="caps-list"></dl>
+      </section>
+    </div>
+  </main>
+</body>
+</html>

@@ -4,6 +4,7 @@
 // with AWS Signature Version 4, implemented on node:crypto + fetch.
 
 const crypto = require('node:crypto');
+const fs = require('node:fs');
 const { assertHttpsBase } = require('../http-client.js');
 
 const EMPTY_SHA256 = crypto.createHash('sha256').update('').digest('hex');
@@ -117,6 +118,14 @@ function createS3Storage({
       const status = await send('PUT', key, { body, contentType });
       if (status < 200 || status >= 300) throw new StorageError('storage_error', `PutObject failed with HTTP ${status}.`);
       return { key, bytes: body.length };
+    },
+    // Uploads a local file. The size cap is enforced before the request so a
+    // huge render cannot exhaust memory or the provider's limit.
+    async putFile(filePath, key, contentType = 'application/octet-stream') {
+      const stat = fs.statSync(filePath);
+      if (stat.size <= 0) throw new StorageError('storage_error', 'File is empty.');
+      if (stat.size > maxObjectBytes) throw new StorageError('source_too_large', 'File is too large.');
+      return this.putObject(key, fs.readFileSync(filePath), contentType);
     },
     async deleteObject(key) {
       const status = await send('DELETE', key);
