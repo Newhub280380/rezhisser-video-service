@@ -26,7 +26,7 @@ const NO_STORE = { 'Cache-Control': 'no-store' };
 const BRIEF_FIELDS = { brief: 900, niche: 120, subject: 120, location: 120, style: 200, audience: 200, music: 120 };
 const MAX_CAPTIONS = 36;
 const PHOTO_MODES = ['studio', 'ai'];
-const ACCOUNT_PATHS = ['/api/film/jobs', '/api/film/audio/library', '/api/film/audio/link', '/api/film/photos/prepare', '/api/film/inpaint'];
+const ACCOUNT_PATHS = ['/api/film/orders', '/api/film/jobs', '/api/film/audio/library', '/api/film/audio/link', '/api/film/photos/prepare', '/api/film/inpaint'];
 
 function knownError(error) {
   if (error instanceof FilmError || error instanceof InpaintError) return error.status || 400;
@@ -54,13 +54,19 @@ function normalizeCaptions(value) {
 
 function createFilmApi({ config, stack, db, helpers, logger = console }) {
   const { sendJson, readJson, requireUser } = helpers;
-  const { pipeline, photos, inpainter, audio } = stack;
+  const { pipeline, orders, photos, inpainter, audio } = stack;
   const workRoot = path.resolve(config.filmWorkDir);
 
   async function createJob(req, res, user) {
     const payload = await readJson(req, res, SMALL_BODY);
     if (!payload) return;
+    // A spoken script, when given, is the clock of the reel.
+    const voiceover = typeof payload.voiceover === 'string' ? payload.voiceover.trim() : '';
     const input = {
+      voiceover: voiceover || undefined,
+      voiceVoice: typeof payload.voiceVoice === 'string' ? payload.voiceVoice : undefined,
+      narrationStyle: typeof payload.style === 'string' ? payload.style : '',
+      narrationTitle: typeof payload.title === 'string' ? payload.title : '',
       scenes: payload.scenes,
       durationSeconds: payload.durationSeconds,
       aspect: payload.aspect,
@@ -72,7 +78,13 @@ function createFilmApi({ config, stack, db, helpers, logger = console }) {
       cutout: payload.cutout === false ? false : undefined,
     };
     const reelPhotos = Array.isArray(payload.photoIds) ? payload.photoIds.length : 0;
-    if (payload.photoReel === true) {
+    if (voiceover) {
+      // Nothing to plan: the script is the plan, cut to the voice.
+      if (!reelPhotos) throw new PhotoError('photos_required', 'Для ролика с озвучкой нужны фото.', 'photoIds');
+      input.templateId = 'narrated-reel';
+      input.photoMode = 'studio';
+      input.scenes = undefined;
+    } else if (payload.photoReel === true) {
       // One scene per photo; nothing to describe.
       if (!reelPhotos) throw new PhotoError('photos_required', 'Сначала подготовьте фото.', 'photoIds');
       input.templateId = 'photo-reel';
@@ -137,7 +149,29 @@ function createFilmApi({ config, stack, db, helpers, logger = console }) {
       .pipe(res);
   }
 
+  // One request per order; every reel inside it is a normal film job.
+  async function createOrder(req, res, user) {
+    const payload = await readJson(req, res, SMALL_BODY);
+    if (!payload) return;
+    const order = await orders.start(user, {
+      title: payload.title,
+      count: payload.count,
+      titles: payload.titles,
+      photoIds: payload.photoIds,
+      aspect: payload.aspect,
+      secondsPerPhoto: payload.secondsPerPhoto,
+      backdrop: payload.backdrop,
+      cutout: payload.cutout,
+      style: payload.style,
+      audio: payload.audio ? audio.resolve(user.id, payload.audio) : null,
+      voice: payload.voice ? audio.resolve(user.id, payload.voice) : null,
+    });
+    // view() is async: without the await the response would carry {}.
+    sendJson(res, 201, { order: await orders.view(order, { withReels: false }) }, NO_STORE);
+  }
+
   async function route(req, res, pathname) {
+    const orderMatch = pathname.match(/^\/api\/film\/orders\/([^/]+)(?:\/(cancel|retry))?$/);
     const { method } = req;
     if (method === 'GET' && pathname === '/api/film/capabilities') {
       sendJson(res, 200, stack.capabilities());
@@ -155,10 +189,30 @@ function createFilmApi({ config, stack, db, helpers, logger = console }) {
     }
 
     const jobMatch = pathname.match(/^\/api\/film\/jobs\/([^/]+)(?:\/(video|cancel))?$/);
-    if (!jobMatch && !ACCOUNT_PATHS.includes(pathname)) return false;
+    if (!jobMatch && !orderMatch && !ACCOUNT_PATHS.includes(pathname)) return false;
     const user = await requireUser(req, res);
     if (!user) return true;
 
+    if (pathname === '/api/film/orders' && method === 'POST') {
+      await createOrder(req, res, user);
+      return true;
+    }
+    if (pathname === '/api/film/orders' && method === 'GET') {
+      sendJson(res, 200, { orders: await orders.list(user) }, NO_STORE);
+      return true;
+    }
+    if (orderMatch && method === 'GET' && !orderMatch[2]) {
+      sendJson(res, 200, { order: await orders.get(user, orderMatch[1]) }, NO_STORE);
+      return true;
+    }
+    if (orderMatch && method === 'POST' && orderMatch[2] === 'cancel') {
+      sendJson(res, 200, { order: await orders.cancel(user, orderMatch[1]) }, NO_STORE);
+      return true;
+    }
+    if (orderMatch && method === 'POST' && orderMatch[2] === 'retry') {
+      sendJson(res, 200, { order: await orders.retry(user, orderMatch[1]) }, NO_STORE);
+      return true;
+    }
     if (pathname === '/api/film/jobs' && method === 'POST') {
       await createJob(req, res, user);
       return true;

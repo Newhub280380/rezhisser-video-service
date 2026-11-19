@@ -21,7 +21,9 @@ const { createPhotoPipeline } = require('./photos.js');
 const { createSceneRenderer } = require('./render.js');
 const { createCache } = require('./cache.js');
 const { createFilmPipeline } = require('./jobs.js');
+const { createOrderService, MAX_ITEMS } = require('./orders.js');
 const { createStudio, listBackdrops } = require('./studio.js');
+const { createVoice, DEFAULT_VOICE, FALLBACK_VOICE } = require('./voice.js');
 const { MIN_SCENES, MAX_SCENES, BASE_RESOLUTIONS, TARGET_RESOLUTIONS } = require('./schema.js');
 
 function int(value, fallback, min, max) {
@@ -95,6 +97,12 @@ function filmConfig(env = process.env) {
     filmRenderEndpoint: (env.FILM_RENDER_ENDPOINT || '').trim(),
     filmDriverPath: path.join(__dirname, '..', '..', 'python', 'rezhisser_film', 'film_job.py'),
     ytDlpBin: env.YT_DLP_BIN || 'yt-dlp',
+    voice: {
+      bin: env.EDGE_TTS_BIN || 'edge-tts',
+      defaultVoice: (env.EDGE_TTS_VOICE || DEFAULT_VOICE).trim(),
+      fallbackVoice: (env.EDGE_TTS_FALLBACK_VOICE || FALLBACK_VOICE).trim(),
+      rate: (env.EDGE_TTS_RATE || '+0%').trim(),
+    },
     sglang: {
       baseUrl: (env.SGLANG_BASE_URL || '').trim(),
       model: (env.SGLANG_MODEL || '').trim(),
@@ -196,7 +204,13 @@ function createFilmStack(config, { db, storage = null, billing = null, seedance 
     ...processRunner,
   });
   const cache = createCache({ dir: config.filmCacheDir });
-  const pipeline = createFilmPipeline({ config, db, storage, billing, planner, ray, sky, localPool, studioPool, upscaler, composer, cache, fetchImpl, logger });
+  const voice = createVoice({
+    ...config.voice,
+    workDir: path.join(config.filmWorkDir, 'voice'),
+    ...processRunner,
+  });
+  const pipeline = createFilmPipeline({ config, db, storage, billing, planner, voice, ray, sky, localPool, studioPool, upscaler, composer, cache, fetchImpl, logger });
+  const orders = createOrderService({ config, db, pipeline, photos, logger });
 
   // What works right now. Variable names only, never values.
   function capabilities() {
@@ -211,6 +225,8 @@ function createFilmStack(config, { db, storage = null, billing = null, seedance 
         upgrade: planner ? [] : [config.sglang.baseUrl ? '' : 'SGLANG_BASE_URL', config.sglang.model ? '' : 'SGLANG_MODEL'].filter(Boolean),
         missing: [],
       },
+      // A batch of reels ordered as one piece of work.
+      orders: { available: true, maxReels: MAX_ITEMS, atOnce: config.filmMaxActivePerUser },
       // Reels from the buyer's own photos, rendered on this host.
       studio: { available: true, engine: 'ffmpeg', backdrops: listBackdrops(), concurrency: config.filmStudioConcurrency, free: config.filmStudioFree },
       // Generating scenes from text needs a video model.
@@ -225,6 +241,8 @@ function createFilmStack(config, { db, storage = null, billing = null, seedance 
         missing: upscaler ? [] : ['RECAVSR_COMMAND'],
       },
       audio: audio.capability(),
+      // A spoken script: the voice sets the length of every scene.
+      voice: voice.capability(),
       photos: photos.capability(),
       inpaint: inpainter.capability(),
       cache: { enabled: cache.enabled },
@@ -232,7 +250,7 @@ function createFilmStack(config, { db, storage = null, billing = null, seedance 
     };
   }
 
-  return { pipeline, planner, ray, sky, localPool, studio, studioPool, upscaler, composer, audio, photos, inpainter, cache, capabilities };
+  return { pipeline, orders, voice, planner, ray, sky, localPool, studio, studioPool, upscaler, composer, audio, photos, inpainter, cache, capabilities };
 }
 
 module.exports = { filmConfig, createFilmStack, limited };

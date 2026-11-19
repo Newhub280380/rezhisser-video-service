@@ -186,6 +186,8 @@ function normalizeScene(raw, index, previous) {
     transition: oneOf(raw.transition, TRANSITIONS, 'cut'),
     onScreenText: cleanText(raw.onScreenText, LIMITS.onScreenText),
     voiceover: cleanText(raw.voiceover, LIMITS.voiceover),
+    // Where the scene starts in the spoken audio; only a narrated plan has it.
+    ...(Number.isFinite(raw.startSeconds) ? { startSeconds: Math.max(0, Math.round(raw.startSeconds * 100) / 100) } : {}),
     location: cleanText(raw.location, LIMITS.location),
     characters,
     continuity: cleanText(raw.continuity, LIMITS.continuity),

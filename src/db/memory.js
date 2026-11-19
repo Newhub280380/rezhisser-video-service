@@ -11,7 +11,7 @@ const path = require('node:path');
 
 const TABLES = [
   'users', 'passwordResets', 'videoJobs', 'payments', 'usageEvents', 'projects',
-  'automationTasks', 'automationRuns', 'filmJobs', 'filmShots', 'infraLeases',
+  'automationTasks', 'automationRuns', 'filmJobs', 'filmOrders', 'filmShots', 'infraLeases',
 ];
 
 const ACTIVE_RUN_STATUSES = new Set(['queued', 'running']);
@@ -500,6 +500,47 @@ function createMemoryDatabase({ file = null } = {}) {
     async listFilmJobsByStatus(statuses = []) {
       const set = new Set(statuses);
       return clone(Array.from(state.filmJobs.values()).filter((job) => set.has(job.status)));
+    },
+
+    async createFilmOrder(order) {
+      return mutate(() => {
+        const now = nowIso();
+        const row = {
+          status: 'queued',
+          total: 0,
+          done: 0,
+          failed: 0,
+          items: [],
+          options: null,
+          completedAt: null,
+          createdAt: now,
+          updatedAt: now,
+          ...order,
+        };
+        state.filmOrders.set(row.id, row);
+        return clone(row);
+      });
+    },
+    async updateFilmOrder(id, patch) {
+      return mutate(() => {
+        const order = state.filmOrders.get(id);
+        if (!order) return null;
+        Object.assign(order, patch, { updatedAt: nowIso() });
+        if ('completedAt' in patch) order.completedAt = iso(patch.completedAt);
+        return clone(order);
+      });
+    },
+    async getFilmOrder(id) {
+      return clone(state.filmOrders.get(id));
+    },
+    async listFilmOrders(userId, { limit = 20 } = {}) {
+      return clone(
+        Array.from(state.filmOrders.values()).filter((order) => order.userId === userId).sort(byNewest).slice(0, limit),
+      );
+    },
+    async listFilmOrdersByStatus(statuses = []) {
+      const set = new Set(statuses);
+      return clone(Array.from(state.filmOrders.values()).filter((order) => set.has(order.status)));
     },
 
     async createFilmShot(shot) {

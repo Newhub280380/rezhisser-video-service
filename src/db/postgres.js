@@ -59,6 +59,11 @@ const COLUMNS = {
     error: 'error', createdAt: 'created_at', updatedAt: 'updated_at', completedAt: 'completed_at',
     expiresAt: 'expires_at',
   },
+  film_orders: {
+    id: 'id', userId: 'user_id', title: 'title', status: 'status', total: 'total', done: 'done',
+    failed: 'failed', items: 'items', options: 'options', createdAt: 'created_at',
+    updatedAt: 'updated_at', completedAt: 'completed_at',
+  },
   film_shots: {
     id: 'id', jobId: 'job_id', sceneNumber: 'scene_number', status: 'status', prompt: 'prompt',
     params: 'params', attempts: 'attempts', providerTaskId: 'provider_task_id', clipKey: 'clip_key',
@@ -74,7 +79,7 @@ const COLUMNS = {
     updatedAt: 'updated_at',
   },
 };
-const JSON_COLUMNS = new Set(['brief', 'error', 'log', 'plan', 'audio', 'options', 'infra', 'params', 'detail']);
+const JSON_COLUMNS = new Set(['brief', 'error', 'log', 'plan', 'audio', 'options', 'infra', 'params', 'detail', 'items']);
 const NUMERIC_FIELDS = new Set([
   'costUsd', 'videoBytes', 'amountMinor', 'outputBytes', 'hourlyUsd', 'durationSeconds',
 ]);
@@ -397,6 +402,20 @@ function createPostgresDatabase({ connectionString, ssl, pool: injectedPool, lib
     // Statuses that mean "a cluster may still be rented for this job".
     listFilmJobsByStatus: (statuses = []) =>
       many('film_jobs', 'SELECT * FROM film_jobs WHERE status = ANY($1)', [statuses]),
+
+    createFilmOrder(order) {
+      const sql = insertSql('film_orders', { status: 'queued', total: 0, done: 0, failed: 0, items: [], ...order });
+      return one('film_orders', sql.text, sql.values);
+    },
+    updateFilmOrder(id, patch) {
+      const sql = updateSql('film_orders', id, patch);
+      return one('film_orders', sql.text, sql.values);
+    },
+    getFilmOrder: (id) => one('film_orders', 'SELECT * FROM film_orders WHERE id = $1', [id]),
+    listFilmOrders: (userId, { limit = 20 } = {}) =>
+      many('film_orders', 'SELECT * FROM film_orders WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2', [userId, limit]),
+    listFilmOrdersByStatus: (statuses = []) =>
+      many('film_orders', 'SELECT * FROM film_orders WHERE status = ANY($1)', [statuses]),
 
     createFilmShot(shot) {
       const sql = insertSql('film_shots', { attempts: 0, costUsd: 0, status: 'pending', ...shot });

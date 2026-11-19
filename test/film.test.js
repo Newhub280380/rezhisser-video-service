@@ -32,6 +32,8 @@ const { createInpainter } = require('../src/film/inpaint.js');
 const { createSceneRenderer, downloadClip } = require('../src/film/render.js');
 const { createFilmPipeline } = require('../src/film/jobs.js');
 const { filmConfig, createFilmStack, limited } = require('../src/film/index.js');
+const { createOrderService, normalizeTitles } = require('../src/film/orders.js');
+const { createVoice, parseCues, srtOf, sceneTimings } = require('../src/film/voice.js');
 const { createMemoryDatabase } = require('../src/db/memory.js');
 const { withServer, fakeServices, productionOptions, accountClient } = require('./helpers/production.js');
 
@@ -959,9 +961,9 @@ function fakeBilling() {
   };
 }
 
-async function pipelineFixture({ sky = null, ray = null, runner, planner, upscaler = null, billing = fakeBilling(), storage = null, fetchImpl, now, studioRunner = null, videoModel = true, config = {} } = {}) {
+async function pipelineFixture({ sky = null, ray = null, runner, planner, upscaler = null, billing = fakeBilling(), storage = null, fetchImpl, now, studioRunner = null, videoModel = true, config = {}, voice = null, db: sharedDb = null } = {}) {
   const workDir = tempDir();
-  const db = createMemoryDatabase({ dataDir: tempDir() });
+  const db = sharedDb || createMemoryDatabase({ dataDir: tempDir() });
   const user = await db.createUser({ id: '11111111-1111-4111-8111-111111111111', email: 'a@example.com', passwordHash: 'x' });
   const sceneRunner = runner || (async (scene, context) => {
     const file = path.join(workDir, context.jobId, 'clips', `scene-${scene.n}.mp4`);
@@ -994,6 +996,7 @@ async function pipelineFixture({ sky = null, ray = null, runner, planner, upscal
     storage,
     billing,
     planner: planner === undefined ? { model: 'test-model', writePlan: async () => ({ plan: validatePlan(rawPlan()) }) } : planner,
+    voice,
     ray,
     sky,
     localPool: sky || ray || !videoModel ? null : createLocalPool({ runner: sceneRunner, concurrency: 4, logger: quiet }),
@@ -1408,6 +1411,307 @@ test('config: paid engines are off by default; the built-in ones are always ther
 
 // ---- HTTP ----
 
+// ---- voiceover ----
+
+test('voice: cues and scene lengths come from the service timings', async () => {
+  const srt = [
+    '1',
+    '00:00:00,100 --> 00:00:02,897',
+    'Редкий камень — аметист.',
+    '',
+    '2',
+    '00:00:02,897 --> 00:00:07,341',
+    'Ручная огранка, оправа из серебра.',
+    '',
+    '3',
+    '00:00:07,341 --> 00:00:09,830',
+    'Остался один экземпляр.',
+  ].join('\n');
+  const cues = parseCues(srt);
+  assert.equal(cues.length, 3);
+  assert.deepEqual([cues[0].start, cues[0].end], [0.1, 2.897]);
+  assert.equal(cues[1].text, 'Ручная огранка, оправа из серебра.');
+  assert.deepEqual(parseCues('not a subtitle file'), []);
+  assert.equal(parseCues('').length, 0);
+
+  // One scene per sentence, each ending where the next begins, the last one
+  // running to the end of the audio: the scenes cover the voice exactly.
+  const scenes = sceneTimings(cues, { audioSeconds: 9.83 });
+  assert.equal(scenes.length, 3);
+  assert.equal(scenes[0].start, 0);
+  assert.ok(Math.abs(scenes[2].start + scenes[2].durationSeconds - 9.83) < 0.01);
+  const covered = scenes.reduce((sum, scene) => sum + scene.durationSeconds, 0);
+  assert.ok(Math.abs(covered - 9.83) < 0.05, String(covered));
+  // A long sentence is split: no scene may exceed what the plan allows.
+  const long = sceneTimings([{ start: 0, end: 23, text: 'Очень длинная фраза.' }], { audioSeconds: 23 });
+  assert.equal(long.length, 3);
+  assert.ok(long.every((scene) => scene.durationSeconds <= 10.01));
+  // Nothing of the voice is cut off: the parts still add up to 23 s.
+  assert.ok(Math.abs(long.reduce((sum, scene) => sum + scene.durationSeconds, 0) - 23) < 0.05);
+
+  // SRT out of cues round-trips through the parser.
+  assert.equal(parseCues(srtOf(cues)).length, 3);
+});
+
+test('voice: a dropped request is retried, then another voice is used', async () => {
+  const dir = tempDir();
+  let refusals = 2;
+  const calls = [];
+  const runner = async (bin, argv) => {
+    calls.push([bin, ...argv]);
+    if (argv[0] === '--version') return { ok: true };
+    const media = argv[argv.indexOf('--write-media') + 1];
+    const subs = argv[argv.indexOf('--write-subtitles') + 1];
+    const voice = argv[argv.indexOf('--voice') + 1];
+    if (voice === 'ru-RU-SvetlanaNeural' && refusals > 0) {
+      // The service answers but returns no audio.
+      refusals -= 1;
+      return { ok: true };
+    }
+    fs.writeFileSync(media, 'mp3');
+    fs.writeFileSync(subs, '1\n00:00:00,000 --> 00:00:03,000\nПривет.\n');
+    return { ok: true };
+  };
+  const engine = createVoice({ workDir: dir, runner, bin: 'edge-tts' });
+  const clip = await engine.speak('Привет.', { userId: 'u1', tag: 'job-1' });
+  // Two refusals, then the same voice goes through: no fallback needed.
+  assert.equal(clip.voice, 'ru-RU-SvetlanaNeural');
+  assert.equal(clip.cues.length, 1);
+  assert.ok(fs.existsSync(clip.path));
+  assert.ok(clip.path.includes(path.join('u1', 'job-1')));
+
+  // A voice that never answers falls back to the second one.
+  const onlyFallback = async (bin, argv) => {
+    if (argv[0] === '--version') return { ok: true };
+    const voice = argv[argv.indexOf('--voice') + 1];
+    if (voice === 'ru-RU-SvetlanaNeural') return { ok: true };
+    fs.writeFileSync(argv[argv.indexOf('--write-media') + 1], 'mp3');
+    return { ok: true };
+  };
+  const fallback = await createVoice({ workDir: dir, runner: onlyFallback }).speak('Привет.', { userId: 'u1' });
+  assert.equal(fallback.voice, 'ru-RU-DmitryNeural');
+  assert.equal(fallback.srt, '');
+});
+
+test('voice: a missing tool and empty text are refused with the reason', async () => {
+  const missing = createVoice({ workDir: tempDir(), runner: async () => ({ ok: false, code: 'tool_missing' }) });
+  await assert.rejects(() => missing.speak('Привет.', { userId: 'u1' }), (error) => error.code === 'voice_unavailable' && error.status === 503);
+  const engine = createVoice({ workDir: tempDir(), runner: async (bin, argv) => (argv[0] === '--version' ? { ok: true } : { ok: true }) });
+  await assert.rejects(() => engine.speak('   ', { userId: 'u1' }), (error) => error.code === 'script_required');
+  await assert.rejects(() => engine.speak('x'.repeat(4001), { userId: 'u1' }), (error) => error.code === 'script_too_long');
+  // The voice name is validated: an injected value never reaches the command line.
+  const seen = [];
+  const spy = createVoice({ workDir: tempDir(), runner: async (bin, argv) => {
+    seen.push(argv);
+    if (argv[0] === '--version') return { ok: true };
+    fs.writeFileSync(argv[argv.indexOf('--write-media') + 1], 'mp3');
+    return { ok: true };
+  } });
+  await spy.speak('Привет.', { userId: 'u1', voice: '--evil' });
+  assert.equal(seen[1][seen[1].indexOf('--voice') + 1], 'ru-RU-SvetlanaNeural');
+});
+
+test('pipeline: a narrated reel is cut to the voice, not to fixed scenes', async () => {
+  const dir = tempDir();
+  const photo = path.join(dir, 'a.jpg');
+  fs.writeFileSync(photo, 'a');
+  const photos = [{ id: 'a', path: photo, fullPath: photo, cutPath: null }];
+  const spoken = { path: path.join(dir, 'voice.mp3'), voice: 'ru-RU-SvetlanaNeural', bytes: 10, srt: '', cues: [
+    { start: 0, end: 3, text: 'Первый кадр.' },
+    { start: 3, end: 8, text: 'Второй кадр.' },
+  ] };
+  fs.writeFileSync(spoken.path, 'mp3');
+  const clip = async (scene, context) => {
+    const file = path.join(dir, context.jobId, `s-${scene.n}.mp4`);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, 'clip');
+    return { path: file };
+  };
+  const fx = await pipelineFixture({ videoModel: false, studioRunner: clip, planner: null, voice: { speak: async () => spoken, sceneTimings } });
+  const pipeline = fx.pipeline;
+  const job = await pipeline.start(fx.user, {
+    templateId: 'narrated-reel',
+    photoMode: 'studio',
+    photos,
+    voiceover: 'Первый кадр.\nВторой кадр.',
+  });
+  const done = await fx.finished(job.id);
+  assert.equal(done.status, 'succeeded', JSON.stringify(done.error));
+  assert.equal(done.engine, 'voice');
+  assert.equal(done.aspect, '9:16');
+  assert.deepEqual(done.plan.scenes.map((scene) => scene.durationSeconds), [3, 5]);
+  assert.deepEqual(done.plan.scenes.map((scene) => scene.onScreenText), ['Первый кадр.', 'Второй кадр.']);
+  // The fixture's composer reports 5 s for any file, shorter than the cues,
+  // so the last scene ends with the last spoken sentence (8 s), not earlier.
+  assert.deepEqual(done.infra.voice, { engine: 'edge-tts', voice: 'ru-RU-SvetlanaNeural', seconds: 5, cues: 2 });
+  assert.match(fx.assembled[0].srt, /Первый кадр[\s\S]*Второй кадр/);
+  // The voice is passed to the assembler as the clock of the film.
+  assert.equal(fx.assembled[0].voice.path, spoken.path);
+
+  // A script without photos is refused before anything runs.
+  await assert.rejects(() => pipeline.start(fx.user, { voiceover: 'Только текст.' }), (error) => error.code === 'photos_required');
+});
+
+// ---- orders: a batch of reels ----
+
+function orderFixture({ config = {}, runner } = {}) {
+  const dir = tempDir();
+  const files = ['a', 'b'].map((name) => {
+    const file = path.join(dir, `${name}.jpg`);
+    fs.writeFileSync(file, name);
+    return { id: name, path: file, fullPath: file, cutPath: null };
+  });
+  const db = createMemoryDatabase({ dataDir: tempDir() });
+  return pipelineFixture({
+    config: { filmMaxActivePerUser: 1, ...config },
+    runner,
+    db,
+  }).then(async (fx) => {
+    // The service is built on the same pipeline, database and photo store.
+    const orders = createOrderService({
+      config: { ...filmConfig({}), filmEnabled: true, filmMaxActivePerUser: 1, ...config },
+      db: fx.db,
+      pipeline: fx.pipeline,
+      photos: { resolve: (userId, ids) => ids.map((id) => files.find((file) => file.id === id)).filter(Boolean) },
+      logger: quiet,
+    });
+    return { ...fx, orders, files, dir };
+  });
+}
+
+const waitForOrder = async (orders, user, id) => {
+  for (let i = 0; i < 400; i += 1) {
+    const order = await orders.get(user, id);
+    if (!['queued', 'running'].includes(order.status)) return order;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error('order did not finish');
+};
+
+test('orders: a batch of reels is one piece of work with one progress number', async () => {
+  const dir = tempDir();
+  const clip = async (scene, context) => {
+    const file = path.join(dir, context.jobId, `s-${scene.n}.mp4`);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, 'clip');
+    return { path: file };
+  };
+  const fx = await orderFixture({ runner: clip });
+  const user = fx.user;
+
+  // Three reels: two lines, and the count wins so the third has no caption.
+  const started = await fx.orders.start(user, {
+    title: 'Рилсы для инстаграма',
+    titles: 'Редкий камень\nДоставка по Алматы',
+    count: 3,
+    photoIds: ['a', 'b'],
+  });
+  assert.equal(started.total, 3);
+  assert.equal(started.done, 0);
+  const done = await waitForOrder(fx.orders, user, started.id);
+  assert.equal(done.status, 'succeeded');
+  assert.deepEqual([done.done, done.failed, done.total, done.progress], [3, 0, 3, 100]);
+  assert.deepEqual(done.reels.map((reel) => reel.caption), ['Редкий камень', 'Доставка по Алматы', '']);
+  assert.ok(done.reels.every((reel) => reel.status === 'succeeded' && reel.job && reel.job.video));
+  // Each reel is an ordinary job that points back at the order.
+  assert.equal(done.reels[1].job.order.index, 1);
+  assert.equal(done.reels[1].job.order.id, started.id);
+  // One generation per reel, in order.
+  assert.deepEqual(fx.billing.events, ['consume', 'record', 'consume', 'record', 'consume', 'record']);
+  // The list is a summary: no per-reel payload.
+  const list = await fx.orders.list(user);
+  assert.equal(list.length, 1);
+  assert.equal(list[0].reels, undefined);
+  assert.equal(list[0].done, 3);
+});
+
+test('orders: one failing reel leaves the order partial; the rest are kept and the failures retry', async () => {
+  const dir = tempDir();
+  let calls = 0;
+  const flaky = async (scene, context) => {
+    calls += 1;
+    // The very first rendered scene of the first reel fails.
+    if (calls === 1) throw Object.assign(new Error('renderer died'), { code: 'studio_render_failed' });
+    const file = path.join(dir, context.jobId, `s-${scene.n}.mp4`);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, 'clip');
+    return { path: file };
+  };
+  const fx = await orderFixture({ runner: flaky });
+  const started = await fx.orders.start(fx.user, { titles: 'Первый\nВторой', count: 2, photoIds: ['a'] });
+  const failed = await waitForOrder(fx.orders, fx.user, started.id);
+  assert.equal(failed.status, 'partial');
+  assert.deepEqual([failed.done, failed.failed], [1, 1]);
+  assert.equal(failed.reels[0].status, 'failed');
+  assert.equal(failed.reels[1].status, 'succeeded');
+  // The failed reel was refunded before the next one was charged.
+  assert.deepEqual(fx.billing.events, ['consume', 'record', 'refund', 'consume', 'record']);
+
+  // A retry rebuilds only the failed reel — no client input needed.
+  const retried = await fx.orders.retry(fx.user, started.id);
+  assert.equal(retried.status, 'running');
+  const after = await waitForOrder(fx.orders, fx.user, started.id);
+  assert.equal(after.status, 'succeeded');
+  assert.deepEqual([after.done, after.failed], [2, 0]);
+  assert.deepEqual(after.reels.map((reel) => reel.caption), ['Первый', 'Второй']);
+
+  // Nothing failed any more, so a second retry is refused.
+  await assert.rejects(() => fx.orders.retry(fx.user, started.id), (error) => error.code === 'nothing_to_retry');
+});
+
+test('orders: reels wait for the account limit instead of failing; cancel stops the queue', async () => {
+  const dir = tempDir();
+  let running = 0;
+  let peak = 0;
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const slow = async (scene, context) => {
+    running += 1;
+    peak = Math.max(peak, running);
+    await gate;
+    running -= 1;
+    const file = path.join(dir, context.jobId, `s-${scene.n}.mp4`);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, 'clip');
+    return { path: file };
+  };
+  // The pipeline allows two jobs per account; the order may use at most two
+  // of them and must not trip the limit on its own.
+  const fx = await orderFixture({ runner: slow, config: { filmMaxActivePerUser: 2 } });
+  const started = await fx.orders.start(fx.user, { count: 4, photoIds: ['a'] });
+  // Four reels, two slots: the other two wait rather than fail.
+  await new Promise((resolve) => setTimeout(resolve, 600));
+  const midway = await fx.orders.get(fx.user, started.id);
+  assert.equal(midway.status, 'running');
+  assert.deepEqual([midway.done, midway.failed], [0, 0]);
+  assert.ok(peak <= 2, `peak ${peak}`);
+
+  const canceled = await fx.orders.cancel(fx.user, started.id);
+  release();
+  const after = await waitForOrder(fx.orders, fx.user, started.id);
+  assert.equal(after.status, 'canceled');
+  assert.ok(after.failed <= 4);
+  assert.equal(canceled.status !== 'succeeded', true);
+});
+
+test('orders: input is validated before anything starts', async () => {
+  const fx = await orderFixture({ runner: async (scene, context) => {
+    const file = path.join(fx.dir, context.jobId, `s-${scene.n}.mp4`);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, 'clip');
+    return { path: file };
+  } });
+  await assert.rejects(() => fx.orders.start(fx.user, { count: 2 }), (error) => error.code === 'photos_required');
+  await assert.rejects(() => fx.orders.start(fx.user, { count: 0, photoIds: ['a'] }), (error) => error.code === 'invalid_order_size');
+  await assert.rejects(() => fx.orders.start(fx.user, { count: 51, photoIds: ['a'] }), (error) => error.code === 'invalid_order_size');
+  // Nothing was created by the rejected requests.
+  assert.deepEqual(await fx.orders.list(fx.user), []);
+  // Someone else's order is not readable.
+  const created = await fx.orders.start(fx.user, { count: 1, photoIds: ['a'] });
+  await assert.rejects(() => fx.orders.get({ id: 'other' }, created.id), (error) => error.code === 'order_not_found');
+  assert.equal((await waitForOrder(fx.orders, fx.user, created.id)).status, 'succeeded');
+});
+
 function filmServerOptions(services, { film = {}, runners } = {}) {
   const dir = tempDir();
   return productionOptions(services, {
@@ -1481,6 +1785,65 @@ test('http: a template reel end to end — account, quota, render, download', as
     await other.register('other@example.com');
     assert.equal((await other.get(`/api/film/jobs/${id}`)).status, 404);
     assert.equal((await other.get('/api/film/jobs')).json.jobs.length, 0);
+  });
+});
+
+test('http (real ffmpeg): an order of three reels — one request, 3 of 3 ready, downloadable files', { skip: !HAS_FFMPEG, timeout: 240000 }, async () => {
+  const dir = tempDir();
+  const options = filmServerOptions(fakeServices(), { film: { filmTargetResolution: '1080p', filmStudioFree: true, photoSteps: { removeBg: 'off', enhance: '' } } });
+  options.seedance = { apiKey: '' };
+  options.s3 = { endpoint: '', bucket: '', accessKeyId: '', secretAccessKey: '' };
+  await withServer(options, async ({ base, app }) => {
+    const api = accountClient(base);
+    const userId = (await api.register('orders@example.com')).json.user.id;
+    const prepared = await api.post('/api/film/photos/prepare', { photos: [asDataUrl(productPhoto(path.join(dir, 'a.jpg')))] });
+    assert.equal(prepared.status, 201, JSON.stringify(prepared.json));
+
+    const created = await api.post('/api/film/orders', {
+      title: 'Рилсы для инстаграма',
+      count: 3,
+      titles: 'Редкий камень\nДоставка по Алматы',
+      photoIds: [prepared.json.photos[0].id],
+      secondsPerPhoto: 2,
+    });
+    assert.equal(created.status, 201, JSON.stringify(created.json));
+    assert.deepEqual([created.json.order.total, created.json.order.done], [3, 0]);
+
+    // Poll the order the way the page does.
+    let order;
+    for (let i = 0; i < 4000; i += 1) {
+      order = (await api.get(`/api/film/orders/${created.json.order.id}`)).json.order;
+      if (!['queued', 'running'].includes(order.status)) break;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    assert.equal(order.status, 'succeeded', JSON.stringify(order));
+    assert.deepEqual([order.done, order.failed, order.total], [3, 0, 3]);
+    assert.deepEqual(order.reels.map((reel) => reel.caption), ['Редкий камень', 'Доставка по Алматы', '']);
+    assert.ok(order.reels.every((reel) => reel.job && reel.job.status === 'succeeded'));
+
+    // Each reel is a real, separate file.
+    for (const reel of order.reels) {
+      const response = await fetch(`${base}${reel.job.video.download}`, { headers: { Authorization: `Bearer ${api.state.token}` } });
+      assert.equal(response.status, 200);
+      const file = path.join(dir, `reel-${reel.index}.mp4`);
+      fs.writeFileSync(file, Buffer.from(await response.arrayBuffer()));
+      const video = probeVideo(file);
+      assert.deepEqual([video.codec_name, video.width, video.height], ['h264', 1080, 1920]);
+    }
+    // Free studio reels: the account was not charged.
+    assert.equal((await app.db.getUserById(userId)).credits, 0);
+
+    // The list is a summary, and the order is visible there.
+    const list = (await api.get('/api/film/orders')).json.orders;
+    assert.equal(list.length, 1);
+    assert.equal(list[0].done, 3);
+
+    // A canceled order that has not started yet cancels cleanly.
+    const second = await api.post('/api/film/orders', { count: 2, photoIds: [prepared.json.photos[0].id], secondsPerPhoto: 2 });
+    assert.equal(second.status, 201);
+    const canceled = await api.post(`/api/film/orders/${second.json.order.id}/cancel`);
+    assert.equal(canceled.status, 200);
+    assert.ok(['canceled', 'partial', 'succeeded'].includes(canceled.json.order.status), canceled.json.order.status);
   });
 });
 
