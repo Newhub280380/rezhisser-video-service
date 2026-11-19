@@ -172,6 +172,27 @@ CREATE TABLE IF NOT EXISTS film_jobs (
 CREATE INDEX IF NOT EXISTS film_jobs_user_created_idx ON film_jobs (user_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS film_jobs_status_idx ON film_jobs (status);
 
+-- A batch of reels ordered as one piece of work ("20 reels for Instagram").
+-- Its reels are ordinary film_jobs rows; this table is the request around them.
+CREATE TABLE IF NOT EXISTS film_orders (
+  id UUID PRIMARY KEY,
+  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  title TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'succeeded', 'partial', 'failed', 'canceled')),
+  total INTEGER NOT NULL DEFAULT 0 CHECK (total >= 0),
+  done INTEGER NOT NULL DEFAULT 0 CHECK (done >= 0),
+  failed INTEGER NOT NULL DEFAULT 0 CHECK (failed >= 0),
+  -- One entry per reel: { index, caption, status, jobId?, error? }
+  items JSONB NOT NULL DEFAULT '[]'::jsonb,
+  -- Everything a retry needs: aspect, seconds per photo, photo ids, audio.
+  options JSONB,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  completed_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS film_orders_user_created_idx ON film_orders (user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS film_orders_status_idx ON film_orders (status);
+
 CREATE TABLE IF NOT EXISTS film_shots (
   id UUID PRIMARY KEY,
   job_id UUID NOT NULL REFERENCES film_jobs(id) ON DELETE CASCADE,

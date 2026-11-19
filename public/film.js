@@ -20,7 +20,7 @@
     canceled: 'отменено',
     needs_attention: 'готово, но кластер не удалён',
   };
-  var state = { templates: [], selected: null, audio: null, voice: null, photoIds: [], timer: null, mask: null };
+  var state = { templates: [], selected: null, audio: null, voice: null, photoIds: [], timer: null, mask: null, orderTimer: null };
 
   function $(id) { return document.getElementById(id); }
 
@@ -382,6 +382,105 @@
     return row;
   }
 
+  // A narrated reel: the voice is spoken first and sets the length of every shot.
+  function startNarrated(button) {
+    if (!state.photoIds.length) { toast('Нужны фото: из них собираются кадры.', 'error'); return; }
+    var script = $('voice-script').value.trim();
+    if (!script) { toast('Напишите текст озвучки.', 'error'); return; }
+    button.disabled = true;
+    api('/jobs', { body: {
+      voiceover: script,
+      voiceVoice: $('voice-name').value,
+      photoIds: state.photoIds,
+      aspect: $('voice-aspect').value,
+      photoMode: 'studio',
+      audio: state.audio ? state.audio.ref : undefined,
+    } }).then(function (data) {
+      // Synthesis happens inside the job: the list shows its stages.
+      toast('Озвучка и ролик запущены: голос синтезируется первым, кадры подстраиваются под него.', 'ok');
+      return loadJobs();
+    }).catch(fail).then(function () { button.disabled = false; });
+  }
+
+  // ---- orders: a batch of reels as one piece of work ----
+
+  var ORDER_STATUS = {
+    queued: 'в очереди', running: 'идёт', succeeded: 'готовы',
+    partial: 'частично', failed: 'не выполнен', canceled: 'отменён',
+  };
+
+  function orderRow(order) {
+    var row = el('li', 'job-row');
+    var title = el('div', 'job-title', order.title);
+    var status = el('span', 'job-status', ORDER_STATUS[order.status] || order.status);
+    status.dataset.state = order.status === 'succeeded' ? 'succeeded' : order.status === 'failed' ? 'failed' : order.status === 'canceled' ? 'canceled' : 'processing';
+    var sub = el('div', 'job-sub', order.done + ' из ' + order.total + ' готово' + (order.failed ? ' · ' + order.failed + ' с ошибкой' : ''));
+    var bar = el('progress', 'job-progress');
+    bar.max = 100;
+    bar.value = order.progress || 0;
+    var actions = el('div', 'job-actions');
+    if (order.status === 'running' || order.status === 'queued') {
+      var cancel = el('button', 'btn btn-ghost', 'Отменить заказ');
+      cancel.type = 'button';
+      cancel.addEventListener('click', function () {
+        cancel.disabled = true;
+        api('/orders/' + order.id + '/cancel', { method: 'POST' }).then(function () { return loadOrders(); }).catch(fail);
+      });
+      actions.append(cancel);
+    }
+    if (order.failed) {
+      var retry = el('button', 'btn btn-ghost', 'Повторить неудачные');
+      retry.type = 'button';
+      retry.addEventListener('click', function () {
+        retry.disabled = true;
+        api('/orders/' + order.id + '/retry', { method: 'POST' }).then(function () { return loadOrders(); }).catch(fail);
+      });
+      actions.append(retry);
+    }
+    row.append(title, status, sub, actions, bar);
+    return row;
+  }
+
+  function loadOrders() {
+    var list = $('order-list');
+    if (!token()) {
+      list.textContent = '';
+      return Promise.resolve();
+    }
+    return api('/orders').then(function (data) {
+      list.textContent = '';
+      if (!data.orders.length) list.append(el('li', 'film-hint', 'Заказов пока нет: соберите пачку из своих фото.'));
+      data.orders.forEach(function (order) { list.append(orderRow(order)); });
+      var active = data.orders.some(function (order) { return order.status === 'running' || order.status === 'queued'; });
+      window.clearTimeout(state.orderTimer);
+      if (active) state.orderTimer = window.setTimeout(loadOrders, 4000);
+    }).catch(fail);
+  }
+
+  // One request per order: each line becomes one reel with its own caption.
+  function startOrder(button) {
+    if (!state.photoIds.length) { toast('Сначала подготовьте фото — из них собираются все ролики заказа.', 'error'); return; }
+    var lines = $('order-titles').value.split('\n').map(function (line) { return line.trim(); }).filter(Boolean);
+    var count = Number($('order-count').value) || 1;
+    button.disabled = true;
+    api('/orders', { method: 'POST', body: {
+      title: $('order-title').value.trim(),
+      count: Math.max(count, lines.length),
+      titles: lines,
+      photoIds: state.photoIds,
+      aspect: $('order-aspect').value,
+      secondsPerPhoto: Number($('order-seconds').value),
+      cutout: $('order-look').value === 'cutout',
+      audio: state.audio ? state.audio.ref : undefined,
+      voice: state.voice || undefined,
+    } }).then(function (data) {
+      toast('Заказ принят: ' + data.order.total + ' роликов.', 'ok');
+      $('order-titles').value = '';
+      $('order-title').value = '';
+      return loadOrders();
+    }).catch(fail).then(function () { button.disabled = false; });
+  }
+
   function loadJobs() {
     var list = $('job-list');
     if (!token()) {
@@ -492,7 +591,7 @@
       state.selected = data.templates.length ? data.templates[0].id : null;
       renderTemplates();
       if (token()) $('film-login').hidden = true;
-      return Promise.all([loadLibrary(), loadJobs()]);
+      return Promise.all([loadLibrary(), loadJobs(), loadOrders()]);
     }).catch(function (error) {
       if (error.status === 404) $('film-off').hidden = false;
       else fail(error);
@@ -516,6 +615,8 @@
     });
     $('photo-upload').addEventListener('click', uploadPhotos);
     $('reel-submit').addEventListener('click', startReel);
+    $('order-submit').addEventListener('click', function () { startOrder($('order-submit')); });
+    $('voice-submit').addEventListener('click', function () { startNarrated($('voice-submit')); });
     $('photo-clear').addEventListener('click', function () {
       state.photoIds = [];
       showReelForm();

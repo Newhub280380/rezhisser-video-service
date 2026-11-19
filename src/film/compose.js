@@ -43,8 +43,10 @@ function buildSubtitles(plan, { includeVoiceover = true } = {}) {
   const cues = [];
   let cursor = 0;
   for (const scene of plan.scenes) {
-    const start = cursor;
-    cursor += scene.durationSeconds;
+    // A narrated plan knows where each scene really starts; without it the
+    // scenes are simply laid end to end.
+    const start = Number.isFinite(scene.startSeconds) ? scene.startSeconds : cursor;
+    cursor = start + scene.durationSeconds;
     const text = String(scene.onScreenText || (includeVoiceover ? scene.voiceover : '') || '').replace(/\s+/g, ' ').trim();
     if (text) cues.push({ index: cues.length + 1, start, end: cursor, text });
   }

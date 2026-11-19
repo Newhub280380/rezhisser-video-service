@@ -23,7 +23,7 @@ const { validatePlan, outputSize, ASPECTS, MIN_SCENES, MAX_SCENES } = require('.
 const { buildSubtitles } = require('./compose.js');
 const { consistencyPrompt } = require('./photos.js');
 const { downloadClip } = require('./render.js');
-const { buildStoryboard, applyCaptions } = require('./storyboard.js');
+const { buildStoryboard, buildNarratedScenes, applyCaptions } = require('./storyboard.js');
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const ACTIVE_STATUSES = ['queued', 'planning', 'provisioning', 'rendering', 'upscaling', 'assembling'];
@@ -57,6 +57,7 @@ function createFilmPipeline({
   storage = null,
   billing = null,
   planner = null,
+  voice = null,
   ray = null,
   sky = null,
   localPool = null,
@@ -101,6 +102,7 @@ function createFilmPipeline({
     return {
       id: job.id,
       status: job.status,
+      order: job.options && job.options.order ? job.options.order : null,
       stage: job.stage,
       templateId: job.templateId,
       sceneCount: job.sceneCount,
@@ -140,8 +142,24 @@ function createFilmPipeline({
 
   async function planStage(job, input) {
     await patch(job.id, { status: 'planning', stage: 'plan' });
+    if (input.voiceover) return narrate(job, input);
     const planned = await writePlan(job, input);
     return { ...planned, plan: applyCaptions(planned.plan, input.captions) };
+  }
+
+  // A reel with a script: the voice is spoken first, then the picture is cut
+  // to the exact length of every sentence.
+  async function narrate(job, input) {
+    const spoken = await voice.speak(input.voiceover, { userId: job.userId, voice: input.voiceVoice, tag: job.id });
+    const seconds = await (composer && composer.probeDuration ? composer.probeDuration(spoken.path) : Promise.resolve(null)) || spoken.cues.reduce((sum, cue) => sum + Math.max(0, cue.end - cue.start), 0);
+    const timings = voice.sceneTimings(spoken.cues, { audioSeconds: seconds || 0 });
+    if (!timings.length) throw new FilmError('voice_empty', 'Из текста не получилось ни одной фразы: проверьте текст озвучки.', 422);
+    const built = buildNarratedScenes({ timings, photoCount: input.photos ? input.photos.length : 0, aspect: job.aspect, style: input.narrationStyle, title: input.narrationTitle });
+    return {
+      plan: built.plan,
+      engine: 'voice',
+      voice: { path: spoken.path, voice: spoken.voice, seconds: Math.round((seconds || 0) * 100) / 100, cues: spoken.cues.length },
+    };
   }
 
   async function writePlan(job, input) {
@@ -309,7 +327,7 @@ function createFilmPipeline({
 
   // ---- assemble -----------------------------------------------------------
 
-  async function assembleStage(job, plan, clips) {
+  async function assembleStage(job, plan, clips, spoken = null) {
     await patch(job.id, { status: 'assembling', stage: 'assemble', progress: 93 });
     const ordered = [...clips].sort((a, b) => a.scene - b.scene);
     // Real clip lengths drive subtitles and music, not the planned ones.
@@ -325,7 +343,9 @@ function createFilmPipeline({
       seconds,
       srt,
       music: job.audio && job.audio.music ? { path: job.audio.music.path } : null,
-      voice: job.audio && job.audio.voice ? { path: job.audio.voice.path } : null,
+      // A spoken script replaces a chosen voiceover file; the voice is the
+      // clock of the film, so it is used whole, never looped or trimmed.
+      voice: spoken ? { path: spoken.path } : job.audio && job.audio.voice ? { path: job.audio.voice.path } : null,
       frameRate: plan.fps,
     });
     let outputKey = null;
@@ -354,16 +374,25 @@ function createFilmPipeline({
   async function execute(job, input, signal) {
     const state = { lease: null };
     const mode = (job.options && job.options.renderMode) || renderMode();
+    // A stage may finish after the buyer pressed cancel — an external renderer
+    // is free to ignore the signal. The job must not be reported as a success
+    // in that case, so every stage boundary checks the signal.
+    const stopIfCanceled = () => {
+      if (signal.aborted) throw new FilmError('canceled', 'Отменено пользователем.', 409);
+    };
     try {
       const planned = await planStage(job, input);
+      stopIfCanceled();
       const plan = alignDurations(planned.plan, mode);
       await patch(job.id, { plan, planHash: plan.hash, engine: planned.engine, sceneCount: plan.scenes.length, progress: 10 });
       for (const scene of plan.scenes) {
         await db.createFilmShot({ id: crypto.randomUUID(), jobId: job.id, sceneNumber: scene.n, prompt: scene.prompt, durationSeconds: scene.durationSeconds });
       }
       const rendered = await renderStage(job, plan, mode, input.photos || [], signal, state, { backdrop: input.backdrop, cutout: input.cutout });
+      stopIfCanceled();
       const upscaled = await upscaleStage(job, rendered, signal, mode);
-      const film = await assembleStage(job, plan, upscaled.clips);
+      stopIfCanceled();
+      const film = await assembleStage(job, plan, upscaled.clips, planned.voice || null);
       const current = await db.getFilmJob(job.id);
       const hours = state.lease ? (now() - Date.parse(state.lease.launchedAt)) / 3600000 : 0;
       await patch(job.id, {
@@ -378,7 +407,7 @@ function createFilmPipeline({
         completedAt: new Date(now()).toISOString(),
         expiresAt: new Date(now() + config.filmRetentionDays * DAY_MS).toISOString(),
         error: null,
-        infra: { ...(current.infra || {}), ...(planned.fallback ? { plannerFallback: planned.fallback } : {}), upscaler: upscaled.engine, audio: film.audioMode, subtitleCues: film.subtitleCues, seconds: Math.round(film.seconds * 100) / 100 },
+        infra: { ...(current.infra || {}), ...(planned.fallback ? { plannerFallback: planned.fallback } : {}), ...(planned.voice ? { voice: { engine: 'edge-tts', voice: planned.voice.voice, seconds: planned.voice.seconds, cues: planned.voice.cues } } : {}), upscaler: upscaled.engine, audio: film.audioMode, subtitleCues: film.subtitleCues, seconds: Math.round(film.seconds * 100) / 100 },
       });
     } catch (error) {
       const canceled = Boolean(signal && signal.aborted);
@@ -412,15 +441,23 @@ function createFilmPipeline({
   async function start(user, input) {
     if (!config.filmEnabled) throw new FilmError('film_disabled', 'Конвейер фильмов выключен (FILM_ENABLED=false).', 503);
     const photos = Array.isArray(input.photos) ? input.photos : [];
+    // Asked first, so a script without photos gets the precise reason instead
+    // of a generic "no video engine".
+    if (input.voiceover) {
+      if (!voice) throw new FilmError('voice_unavailable', 'Озвучка не подключена: установите edge-tts.', 503);
+      if (!photos.length) throw new FilmError('photos_required', 'Для ролика с озвучкой нужны фото.', 400);
+    }
     const mode = modeFor(photos, input.photoMode);
     if (!mode) {
       throw new FilmError('render_not_configured', 'Видеодвижок не подключён. Загрузите свои фото — ролик из них собирается встроенной студией; для генерации с нуля задайте SEEDANCE_API_KEY, RAY_DASHBOARD_URL или SkyPilot.', 503);
     }
-    if (!input.presetPlan && (!input.brief || typeof input.brief.brief !== 'string' || input.brief.brief.trim().length < 8)) {
+    if (!input.voiceover && !input.presetPlan && (!input.brief || typeof input.brief.brief !== 'string' || input.brief.brief.trim().length < 8)) {
       throw new FilmError('brief_required', 'Опишите фильм одной фразой (минимум 8 символов).');
     }
-    const scenes = input.scenes === undefined ? 30 : Number(input.scenes);
-    if (!Number.isInteger(scenes) || scenes < MIN_SCENES || scenes > MAX_SCENES) {
+    // A narrated reel takes its length from the voice, so the scene count is
+    // not asked for (and not restricted to the long-film range).
+    const scenes = input.voiceover ? 0 : input.scenes === undefined ? 30 : Number(input.scenes);
+    if (!input.voiceover && (!Number.isInteger(scenes) || scenes < MIN_SCENES || scenes > MAX_SCENES)) {
       throw new FilmError('invalid_scene_count', `Сцен должно быть от ${MIN_SCENES} до ${MAX_SCENES}.`);
     }
     // One account cannot occupy the whole machine: checked before anything is charged.
@@ -441,12 +478,19 @@ function createFilmPipeline({
         status: 'queued',
         stage: 'queued',
         templateId: input.templateId || null,
-        sceneCount: input.presetPlan ? input.presetPlan.scenes.length : scenes,
-        aspect: input.presetPlan ? input.presetPlan.aspect : ASPECTS.includes(input.aspect) ? input.aspect : '16:9',
+        sceneCount: input.presetPlan ? input.presetPlan.scenes.length : input.voiceover ? null : scenes,
+        // A narrated reel is a vertical reel unless the buyer says otherwise.
+        aspect: input.presetPlan ? input.presetPlan.aspect : ASPECTS.includes(input.aspect) ? input.aspect : input.voiceover ? '9:16' : '16:9',
         baseResolution: config.filmBaseResolution,
         targetResolution: config.filmTargetResolution,
         audio: input.audio || input.voice ? { music: input.audio || null, voice: input.voice || null } : null,
-        options: { billingSource, photos: photos.length, renderMode: mode },
+        options: {
+          billingSource,
+          photos: photos.length,
+          renderMode: mode,
+          // A reel started by an order points back at it.
+          ...(input.order ? { order: { id: String(input.order.id), index: Number(input.order.index) || 0 } } : {}),
+        },
       });
     } catch (error) {
       if (charged) await billing.refundGeneration({ id: null, userId: user.id, billingSource });

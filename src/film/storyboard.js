@@ -94,6 +94,37 @@ function buildPhotoReel({ count, aspect = '9:16', secondsPerPhoto = 4, title = '
   );
 }
 
+// One scene per spoken sentence, each as long as the voice takes. The voice
+// leads: scenes are cut to it, not the other way round. Photos cycle in order.
+function buildNarratedScenes({ timings, photoCount = 0, aspect = '9:16', style = '', title = '' } = {}) {
+  const list = (Array.isArray(timings) ? timings : []).filter((item) => item && item.durationSeconds > 0);
+  if (!list.length) return null;
+  const look = cleanText(style, 200) || 'clean studio light, premium commercial look';
+  const cameras = ['dolly-in', 'pan-left', 'dolly-out', 'pan-right', 'orbit', 'crane-up'];
+  const plan = validatePlan(
+    {
+      title: cleanText(title, 120) || 'Ролик с озвучкой',
+      style: look,
+      aspect,
+      fps: 24,
+      scenes: list.map((item, i) => ({
+        n: i + 1,
+        title: 'Кадр ' + (i + 1),
+        durationSeconds: Math.max(2, Math.min(10, item.durationSeconds)),
+        prompt: 'Slow cinematic camera move over the reference photo; the subject stays exactly as photographed. ' + look + '.',
+        camera: cameras[i % cameras.length],
+        transition: 'cut',
+        // The spoken line is the on-screen text, so subtitles match the voice.
+        onScreenText: cleanText(item.text, 200),
+        // Absolute position of the scene in the audio, used by the assembler.
+        startSeconds: Math.round((item.start || 0) * 100) / 100,
+      })),
+    },
+    { aspect, minScenes: list.length, maxScenes: list.length },
+  );
+  return { plan, photos: photoCount };
+}
+
 // Buyer-written caption lines laid over the scenes in order: with fewer lines
 // than scenes they are spread evenly, so the text spans the whole film.
 function applyCaptions(plan, captions) {
@@ -107,4 +138,4 @@ function applyCaptions(plan, captions) {
   return { ...plan, scenes };
 }
 
-module.exports = { buildStoryboard, buildPhotoReel, applyCaptions, BEATS, REEL_CAMERAS };
+module.exports = { buildStoryboard, buildPhotoReel, buildNarratedScenes, applyCaptions, BEATS, REEL_CAMERAS };
