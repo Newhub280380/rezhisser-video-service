@@ -16,7 +16,8 @@
     "test": "node --test \"test/**/*.test.js\"",
     "check": "npm run lint && npm test && npm run smoke",
     "preview": "node scripts/preview.mjs out --open",
-    "prepare": "node scripts/prepare.mjs"
+    "prepare": "node scripts/prepare.mjs",
+    "app": "node app/server.cjs"
   },
   "license": "MIT",
   "dependencies": {
