@@ -128,6 +128,7 @@ function createVoice({
   timeoutMs = 180000,
   runner = run,
   exists = (file) => fs.existsSync(file),
+  local = null,
 } = {}) {
   // Detected once: a missing CLI is a capability answer, not a crash per job.
   let available = null;
@@ -144,6 +145,8 @@ function createVoice({
       configured: Boolean(workDir),
       bin,
       voices: [defaultVoice, fallbackVoice],
+      // Spoken when edge-tts refuses: the system engine needs no network.
+      fallback: local ? local.capability() : null,
       note: 'бесплатный голос Microsoft через edge-tts; для коммерческих заказов лучше Azure Speech',
       missing: workDir ? [] : ['FILM_WORK_DIR'],
     };
@@ -179,27 +182,45 @@ function createVoice({
     if (raw.length > MAX_TEXT) throw new VoiceError('script_too_long', `Текст озвучки до ${MAX_TEXT} символов.`, 'voiceover');
     const script = normalizeScript(text);
     if (!script) throw new VoiceError('script_required', 'Введите текст озвучки: одна фраза на строку.', 'voiceover');
-    if (!(await probe())) throw new VoiceError('voice_unavailable', 'Не найден edge-tts: установите его (pip install edge-tts), чтобы включить озвучку.');
+    // The offline engine is the safety net: it speaks when edge-tts is missing
+    // or has stopped answering, so a job is not lost to a remote service.
+    const localReady = local ? await local.probe() : false;
+    if (!(await probe()) && !localReady) throw new VoiceError('voice_unavailable', 'Не найден edge-tts: установите его (pip install edge-tts), чтобы включить озвучку.');
 
     const dir = path.join(workDir, String(userId || 'anon'), tag ? String(tag) : crypto.randomUUID());
     fs.mkdirSync(dir, { recursive: true });
     const nonce = crypto.randomBytes(4).toString('hex');
     const primary = voiceOr(defaultVoice, wanted);
     const voices = fallback === false ? [primary] : [...new Set([primary, voiceOr(fallbackVoice, null)])];
-    for (const voice of voices) {
-      for (let attemptNo = 0; attemptNo < ATTEMPTS; attemptNo += 1) {
-        const made = await attempt(script, voice, dir, `${nonce}-${voice.slice(-8)}-${attemptNo}`);
-        if (made) {
-          const cues = made.subs ? parseCues(fs.readFileSync(made.subs, 'utf8')) : [];
-          return {
-            path: made.media,
-            voice,
-            bytes: fs.statSync(made.media).size,
-            cues,
-            srt: cues.length ? srtOf(cues) : '',
-          };
+    if (await probe()) {
+      for (const voice of voices) {
+        for (let attemptNo = 0; attemptNo < ATTEMPTS; attemptNo += 1) {
+          const made = await attempt(script, voice, dir, `${nonce}-${voice.slice(-8)}-${attemptNo}`);
+          if (made) {
+            const cues = made.subs ? parseCues(fs.readFileSync(made.subs, 'utf8')) : [];
+            return {
+              path: made.media,
+              voice,
+              bytes: fs.statSync(made.media).size,
+              cues,
+              srt: cues.length ? srtOf(cues) : '',
+            };
+          }
+          await sleep(RETRY_DELAY_MS * (attemptNo + 1));
         }
-        await sleep(RETRY_DELAY_MS * (attemptNo + 1));
+      }
+    }
+
+    if (localReady) {
+      const spoken = await local.speak(script.split('\n'), { dir, tag: nonce });
+      if (spoken) {
+        return {
+          path: spoken.path,
+          voice: spoken.voice,
+          bytes: spoken.bytes,
+          cues: spoken.cues,
+          srt: spoken.cues.length ? srtOf(spoken.cues) : '',
+        };
       }
     }
     throw new VoiceError('voice_failed', 'Сервис озвучки не ответил. Попробуйте ещё раз через минуту.');

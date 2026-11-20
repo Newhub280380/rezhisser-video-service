@@ -24,6 +24,7 @@ const { createFilmPipeline } = require('./jobs.js');
 const { createOrderService, MAX_ITEMS } = require('./orders.js');
 const { createStudio, listBackdrops } = require('./studio.js');
 const { createVoice, DEFAULT_VOICE, FALLBACK_VOICE } = require('./voice.js');
+const { createLocalVoice, DEFAULT_VOICE: LOCAL_TTS_VOICE } = require('./voice-local.js');
 const { MIN_SCENES, MAX_SCENES, BASE_RESOLUTIONS, TARGET_RESOLUTIONS } = require('./schema.js');
 
 function int(value, fallback, min, max) {
@@ -102,6 +103,12 @@ function filmConfig(env = process.env) {
       defaultVoice: (env.EDGE_TTS_VOICE || DEFAULT_VOICE).trim(),
       fallbackVoice: (env.EDGE_TTS_FALLBACK_VOICE || FALLBACK_VOICE).trim(),
       rate: (env.EDGE_TTS_RATE || '+0%').trim(),
+    },
+    // Offline voice: the system speech engine, used when edge-tts refuses.
+    localVoice: {
+      voice: (env.LOCAL_TTS_VOICE || LOCAL_TTS_VOICE).trim(),
+      ffmpegBin: env.FFMPEG_BIN || 'ffmpeg',
+      ffprobeBin: env.FFPROBE_BIN || 'ffprobe',
     },
     sglang: {
       baseUrl: (env.SGLANG_BASE_URL || '').trim(),
@@ -207,6 +214,7 @@ function createFilmStack(config, { db, storage = null, billing = null, seedance 
   const voice = createVoice({
     ...config.voice,
     workDir: path.join(config.filmWorkDir, 'voice'),
+    local: createLocalVoice({ ...config.localVoice, ...processRunner }),
     ...processRunner,
   });
   const pipeline = createFilmPipeline({ config, db, storage, billing, planner, voice, ray, sky, localPool, studioPool, upscaler, composer, cache, fetchImpl, logger });
