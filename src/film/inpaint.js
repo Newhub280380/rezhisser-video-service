@@ -217,6 +217,8 @@ function createInpainter({
     if (GENERATIVE_MODES.includes(mode)) return editGenerative({ mode, source, maskImage, product, prompt, seed });
     if (!builtIn) throw new InpaintError('inpaint_not_configured', 'Встроенный редактор недоступен.', null, 503);
     if (backdrop && !BACKDROPS[backdrop]) throw new InpaintError('invalid_backdrop', 'Неизвестный фон.', 'backdrop');
+    // A missing area is a request error: report it before any ffmpeg call, so the answer is the same on a host without ffmpeg.
+    if (mode !== 'background' && !maskImage) throw new InpaintError('mask_required', mode === 'insert' ? 'Выделите область, куда поставить товар.' : 'Выделите область, которую нужно убрать.', 'mask');
     return editBuiltIn({ mode, source, maskImage, product, background: background ? decodeImage(background, 'background') : null, backdrop }, userId);
   }
 
