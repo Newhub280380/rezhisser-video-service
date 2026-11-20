@@ -14,7 +14,8 @@
     "lint": "node scripts/check-syntax.mjs",
     "smoke": "node scripts/smoke.mjs",
     "test": "node --test \"test/**/*.test.js\"",
-    "check": "npm run lint && npm test && npm run smoke"
+    "check": "npm run lint && npm test && npm run smoke",
+    "preview": "node scripts/preview.mjs out --open"
   },
   "license": "MIT",
   "dependencies": {
