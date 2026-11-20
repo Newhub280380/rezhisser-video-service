@@ -120,6 +120,80 @@
         </div>
       </section>
 
+      <section class="film-section" aria-labelledby="voice-title">
+        <h2 id="voice-title">Ролик с озвучкой</h2>
+        <p class="film-hint" id="voice-note">Напишите текст — по одной фразе на строку. Сначала синтезируется голос, потом картинка режется под его точную длину: каждая фраза становится своим кадром, а субтитры берутся из её меток. Нужны фото.</p>
+        <form class="film-form" id="voice-form" novalidate>
+          <div class="field field-wide">
+            <label for="voice-script">Текст озвучки</label>
+            <textarea id="voice-script" rows="6" maxlength="4000" placeholder="Редкий камень — аметист из Бразилии.&#10;Ручная огранка, оправа из серебра.&#10;Остался один экземпляр."></textarea>
+          </div>
+          <div class="field">
+            <label for="voice-name">Голос</label>
+            <select id="voice-name">
+              <option value="ru-RU-SvetlanaNeural">Светлана, русский</option>
+              <option value="ru-RU-DmitryNeural">Дмитрий, русский</option>
+              <option value="kk-KZ-AigulNeural">Айгүл, казахский</option>
+              <option value="en-US-AriaNeural">Aria, English</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="voice-aspect">Формат</label>
+            <select id="voice-aspect">
+              <option value="9:16">9:16 — Reels, Shorts</option>
+              <option value="1:1">1:1 — лента</option>
+              <option value="16:9">16:9 — YouTube</option>
+            </select>
+          </div>
+          <div class="film-actions">
+            <button class="btn btn-primary" type="button" id="voice-submit">Собрать с озвучкой</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="film-section" aria-labelledby="orders-title">
+        <h2 id="orders-title">Заказ: пачка роликов</h2>
+        <p class="film-hint" id="orders-note">Один заказ — это несколько роликов из одних и тех же фото. По строке на ролик: каждая строка становится подписью на экране и темой ролика. Готовые ролики можно скачать по одному.</p>
+        <form class="film-form" id="orders-form" novalidate>
+          <div class="field field-wide">
+            <label for="order-title">Название заказа</label>
+            <input id="order-title" type="text" maxlength="80" autocomplete="off" placeholder="Рилсы для инстаграма, ноябрь">
+          </div>
+          <div class="field field-wide">
+            <label for="order-titles">Ролики: по строке на ролик</label>
+            <textarea id="order-titles" rows="6" maxlength="8000" placeholder="Новая коллекция&#10;Редкий камень&#10;Доставка по Алматы"></textarea>
+          </div>
+          <div class="field">
+            <label for="order-count">Сколько роликов</label>
+            <input id="order-count" type="number" min="1" max="50" step="1" value="20">
+          </div>
+          <div class="field">
+            <label for="order-aspect">Формат</label>
+            <select id="order-aspect">
+              <option value="9:16">9:16 — Reels, Shorts</option>
+              <option value="1:1">1:1 — лента</option>
+              <option value="4:5">4:5 — лента</option>
+              <option value="16:9">16:9 — YouTube</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="order-seconds">Секунд на фото</label>
+            <input id="order-seconds" type="number" min="2" max="10" step="1" value="4">
+          </div>
+          <div class="field">
+            <label for="order-look">Подача</label>
+            <select id="order-look">
+              <option value="cutout">Предмет на студийном фоне</option>
+              <option value="photo">Фото целиком</option>
+            </select>
+          </div>
+          <div class="film-actions">
+            <button class="btn btn-primary" type="button" id="order-submit">Оформить заказ</button>
+          </div>
+        </form>
+        <ul class="job-list" id="order-list" aria-live="polite"></ul>
+      </section>
+
       <section class="film-section" aria-labelledby="film-title">
         <h2 id="film-title">Длинный фильм (24–36 сцен)</h2>
         <p class="film-hint" id="film-note">Раскадровку пишет языковая модель (SGLang), а если она не подключена — встроенный раскадровщик. Сцены рендерятся параллельно и собираются в один MP4.</p>

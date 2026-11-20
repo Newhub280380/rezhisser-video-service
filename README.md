@@ -452,10 +452,25 @@ no GPU, no network service and no paid provider:
   own words over a fixed editorial rhythm; it does not write a story.
 - **Captions** (one line per caption, spread over the film), burned-in
   subtitles, music with fades and loudness normalisation, voiceover ducking.
+- **An order: a batch of reels as one piece of work.** "20 reels for
+  Instagram" is one request with one progress number ("12 из 20"), one set of
+  photos and one caption line per reel. Reels wait for the account's own limit
+  instead of failing, and a failed reel leaves the order `partial` and can be
+  retried without the client.
+- **A reel with a voiceover.** Give a script, one sentence per line: the voice
+  is spoken first, then the picture is cut to the exact length of every
+  sentence and the subtitles come from the same timings. Needs `edge-tts`
+  (`pip install edge-tts`) and photos.
 
-Two optional local tools are picked up automatically when installed:
-`rembg` (background removal; without it reels use the whole photo and
-`background` is unavailable) and `yt-dlp` (audio from a video link).
+Three optional local tools are picked up automatically when installed:
+
+- `rembg` — background removal. Without it reels use the whole photo and the
+  `background` product shot is unavailable.
+- `yt-dlp` — audio from a video link.
+- `edge-tts` — voiceover from a script. That is Microsoft's read-aloud service
+  used without a contract: fine for personal work, and for paying clients an
+  operator should switch to Azure Speech (same voices, a proper key). The
+  switch is one function in `src/film/voice.js`.
 
 `FILM_STUDIO_FREE=true` makes studio reels not consume account generations
 (they cost nothing to render). Off by default.
@@ -477,11 +492,13 @@ frames). On a Ray/SkyPilot deployment photos are always rendered by the studio.
 
 - **Run for real** (tests execute them when the tools are installed): the ffmpeg
   assembly, photo clean-up, the studio renderer in every camera move, the three
-  built-in product-shot modes, and one HTTP test that goes from uploaded photos
-  to a downloaded 1080×1920 MP4 with no fakes for the film stages. `rembg`
-  background removal is tested for real only where its model is already
-  downloaded. Audio extraction with `yt-dlp` was run by hand against YouTube,
-  not in the test suite (tests never use the network).
+  built-in product-shot modes, and HTTP tests that go from uploaded photos to a
+  downloaded 1080×1920 MP4 — one reel and a three-reel order — with no fakes for
+  the film stages. `rembg` background removal is tested for real only where its
+  model is already downloaded. Run by hand against the real services, outside
+  the suite (tests never use the network): audio extraction with `yt-dlp` from
+  YouTube, and `edge-tts` voiceover — a three-sentence script gave 10.7 s of
+  audio with exact cue times, and a narrated reel was rendered from it.
 - **Tested against fakes only:** SGLang, Ray, SkyPilot, the upscaler command and
   the generative inpainting service. Their requests follow the public
   documentation, but none has been run against a live server from this
@@ -535,7 +552,12 @@ are not resumed. Finished films are removed after `FILM_RETENTION_DAYS` by
 | `GET` | `/api/film/capabilities` | What works now, which engine does it, and which variables an upgrade needs (names only). |
 | `GET` | `/api/film/templates` | The presets and their locked parameters. |
 | `POST` | `/api/film/presets` | `{ templateId, metadata }` → the fixed shot plan. Free; no provider is called. |
-| `POST` | `/api/film/jobs` | Account. `{ photoReel: true, photoIds, aspect?, secondsPerPhoto?, backdrop?, cutout? }`, or `{ templateId, metadata }`, or `{ brief, scenes, durationSeconds, aspect }`. Optional for all: `photoIds`, `photoMode` (`studio` / `ai`), `captions`, `audio`, `voice` (`{ trackId }` or `{ downloadId }`). |
+| `POST` | `/api/film/orders` | Account. `{ title?, count, titles?, photoIds, aspect?, secondsPerPhoto?, backdrop?, cutout?, audio?, voice? }` → order with `total`, `done`, `failed`, `progress`. |
+| `GET` | `/api/film/orders` | Account. The buyer's orders, summaries only. |
+| `GET` | `/api/film/orders/:id` | Account. One order with every reel and its job. |
+| `POST` | `/api/film/orders/:id/cancel` | Account. Stops the queue and the reels in progress (bounded). |
+| `POST` | `/api/film/orders/:id/retry` | Account. Runs the failed reels again; needs no client input. |
+| `POST` | `/api/film/jobs` | Account. `{ voiceover, voiceVoice?, photoIds }` for a narrated reel, or `{ photoReel: true, photoIds, aspect?, secondsPerPhoto?, backdrop?, cutout? }`, or `{ templateId, metadata }`, or `{ brief, scenes, durationSeconds, aspect }`. Optional for all: `photoIds`, `photoMode` (`studio` / `ai`), `captions`, `audio`, `voice` (`{ trackId }` or `{ downloadId }`). |
 | `GET` | `/api/film/jobs` | Account. The caller's last 50 films. |
 | `GET` | `/api/film/jobs/:id` | Account. Job, plan and per-scene status. |
 | `GET` | `/api/film/jobs/:id/video` | Account. The MP4 (redirect to a signed link, or the file itself). |

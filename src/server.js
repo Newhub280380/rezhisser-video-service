@@ -1161,7 +1161,10 @@ function createApp(options = {}) {
     for (const provider of providers.values()) provider.close();
     production.pipeline.close();
     production.automation.close();
-    if (production.film) production.film.pipeline.close();
+    if (production.film) {
+      production.film.orders.close();
+      production.film.pipeline.close();
+    }
   }
 
   return {
@@ -1203,7 +1206,12 @@ function start(options = {}) {
       // and clusters they left behind are torn down.
       // The background-removal model is fetched once here, off the request path.
       if (app.film) app.film.photos.warmup().then((state) => console.log(`film photo tools: ${state.reason}`)).catch(() => null);
-      return Promise.all([app.pipeline.resume(), app.automation.resume(), app.film ? app.film.pipeline.recover() : null]);
+      return Promise.all([
+        app.pipeline.resume(),
+        app.automation.resume(),
+        app.film ? app.film.orders.recover() : null,
+        app.film ? app.film.pipeline.recover() : null,
+      ]);
     })
     .catch((error) => {
       console.error(`database error: ${error.code || error.message}`);
